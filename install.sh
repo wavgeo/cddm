@@ -4,6 +4,21 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
+# ==========================================================
+#                  Authorization Gate
+# ==========================================================
+SECRET_PASSPHRASE="123456"
+
+read -s -p "Enter authorization key to install CDDM: " USER_INPUT
+echo ""
+
+if [ "$USER_INPUT" != "$SECRET_PASSPHRASE" ]; then
+    echo "❌ Unauthorized: Invalid key. Installation aborted."
+    exit 1
+fi
+echo "✓ Authorized. Proceeding with installation..."
+echo ""
+
 echo "=========================================================="
 echo "          Installing CDDM Live & Desktop Launcher         "
 echo "=========================================================="
@@ -32,7 +47,6 @@ else
     "$DIR/venv/bin/pip" install "PySide6>=6.5.0" "requests>=2.28.0" "certifi>=2023.5.7"
 fi
 
-# Ensure executable permissions on launchers
 chmod +x "$DIR/run_cddm.sh" "$DIR/install.sh" 2>/dev/null || true
 
 # 4. Register application in Ubuntu App Launcher (~/.local/share/applications)
@@ -56,7 +70,6 @@ DESKTOP_EOF
 
 chmod +x "$HOME/.local/share/applications/cddm.desktop"
 
-# Refresh desktop launcher cache so the icon shows up immediately
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 fi
