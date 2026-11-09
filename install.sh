@@ -1,7 +1,13 @@
 #!/bin/bash
+
+# Auto-re-execute with bash if launched via sh/dash
+if [ -z "$BASH_VERSION" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -e
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+DIR="$( cd "$( dirname "$0" )" && pwd )"
 cd "$DIR"
 
 # ==========================================================
