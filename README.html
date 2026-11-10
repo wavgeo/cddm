@@ -406,7 +406,7 @@
     <section id="tab-guide" class="page-section">
 
       <h2>System Requirements & Platform Support</h2>
-      <p>CDDM is engineered for Linux research workstations, supporting standard LTS releases and rolling distributions:</p>
+      <p>CDDM is engineered for cross-platform research workstations, supporting Linux distributions and Windows 10/11:</p>
 
       <table>
         <thead>
@@ -423,13 +423,18 @@
             <td><span class="pill pill-ok" style="min-width:60px;">Supported</span></td>
           </tr>
           <tr>
+            <td><b>Windows OS</b></td>
+            <td>Windows 10 / Windows 11 (64-bit)</td>
+            <td><span class="pill pill-ok" style="min-width:60px;">Supported</span></td>
+          </tr>
+          <tr>
             <td><b>Python Runtime</b></td>
             <td>Python 3.8, 3.10, 3.12, 3.13, 3.14+ (CPython x86_64)</td>
             <td><span class="pill pill-ok" style="min-width:60px;">Supported</span></td>
           </tr>
           <tr>
             <td><b>Desktop Environment</b></td>
-            <td>GNOME, KDE Plasma, XFCE (Wayland & X11 display servers)</td>
+            <td>GNOME, KDE Plasma, XFCE (Wayland & X11) • Windows DWM</td>
             <td><span class="pill pill-ok" style="min-width:60px;">Verified</span></td>
           </tr>
           <tr>
@@ -462,20 +467,37 @@
       </div>
 
       <h2>Automated Setup & Launch</h2>
+      <h3 style="margin-top: 15px;">Option A: Linux (Ubuntu / Debian / Fedora)</h3>
       <ol>
         <li>
           <strong>Extract Archive & Open Terminal in Directory:</strong>
-          <pre><code>unzip CDDM_v1.1.zip
+          <pre><code>unzip CDDM_v1.1_Linux.zip
 cd CDDM</code></pre>
         </li>
         <li>
           <strong>Run Setup Script:</strong>
           <pre><code>./install.sh</code></pre>
-          <p style="font-size: 13px; color: #86868b; margin-top: -12px;">Builds the local virtual environment, installs PySide6, and establishes the Mozilla root CA trust store (<code>certifi</code>) for secure NASA Earthdata HTTPS handshakes.</p>
+          <p style="font-size: 13px; color: #86868b; margin-top: -12px;">Builds the local virtual environment, installs PySide6, and establishes Mozilla root CA trust store (<code>certifi</code>).</p>
         </li>
         <li>
           <strong>Launch Application:</strong>
           <pre><code>./run_cddm.sh</code></pre>
+        </li>
+      </ol>
+
+      <h3 style="margin-top: 25px;">Option B: Windows 10 / 11</h3>
+      <ol>
+        <li>
+          <strong>Prerequisites:</strong>
+          <p style="margin-top: 4px;">Install Python 3.10+ from <a href="https://www.python.org/downloads/" style="color:#2997ff;" target="_blank">python.org</a> and check <strong>"Add python.exe to PATH"</strong>.</p>
+        </li>
+        <li>
+          <strong>Run Windows Installer:</strong>
+          <p style="margin-top: 4px;">Open the <code>windows/</code> directory and double-click <strong><code>install.bat</code></strong>. Enter key <code>123456</code> when prompted. Automatically configures the environment and places a shortcut on your Desktop.</p>
+        </li>
+        <li>
+          <strong>Launch Application:</strong>
+          <p style="margin-top: 4px;">Double-click the <strong>CDDM Live</strong> desktop shortcut, or run <strong><code>windows/run_cddm.bat</code></strong>.</p>
         </li>
       </ol>
 
