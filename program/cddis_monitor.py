@@ -140,6 +140,17 @@ def _make_tone(path):
 
 
 def play_alert_sound():
+    if os.name == "nt":
+        try:
+            import winsound
+            if not os.path.exists(_TONE_PATH):
+                _make_tone(_TONE_PATH)
+            winsound.PlaySound(_TONE_PATH, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        except Exception:
+            QtWidgets.QApplication.beep()
+            return
+
     players = [p for p in ("paplay", "pw-play", "aplay", "play") if shutil.which(p)]
     for snd in _SYSTEM_SOUNDS:
         if os.path.exists(snd) and players:
