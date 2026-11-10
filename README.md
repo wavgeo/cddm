@@ -1,94 +1,14 @@
-# 🛰️ CDDM Live — NASA CDDIS GNSS Archive Monitor
+# ⟰️ CDDM Live — NASA CDDIS GNSS Archive Monitor
 
 [![Python 3](https://img.shields.io/badge/Python-3.8%20--%203.14+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![GUI](https://img.shields.io/badge/GUI-PySide6%20(Qt6)-41CD52?logo=qt&logoColor=white)](https://wiki.qt.io/Qt_for_Python)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20(Ubuntu%2020.04--26.04)-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Linux](https://img.shields.io/badge/Platform-Linux%20(Ubuntu%2020.04--26.04)-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Windows](https://img.shields.io/badge/Platform-Windows%2010%7C11-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An autonomous desktop verification engine designed for geodesy and seismology pipelines. CDDM monitors real-time telemetry, audits historical gaps, and verifies observation completeness across NASA's Crustal Dynamics Data Information System (CDDIS) GNSS archives.
+An autonomous desktop verification engine designed for geodesy and seismology pipelines. CDDM monitors real-time telemetry, audits historical gaps, and verifies observation completeness across NASA CDDIS GNSS archives.
 
----
+---python3 -c "import base64; open('README.md', 'wb').write(base64.b64decode('IyDin7DvuI8gQ0RETSBMaXZlIOKAlCBOQVNBIENERElTIEdOU1MgQXJjaGl2ZSBNb25pdG9yCgpbIVtQeXRob24gM10oaHR0cHM6Ly9pbWcuc2hpZWxkcy5pby9iYWRnZS9QeXRob24tMy44JTIwLS0lMjAzLjE0Ky0zNzc2QUI/bG9nbz1weXRob24mbG9nb0NvbG9yPXdoaXRlKV0oaHR0cHM6Ly93d3cucHl0aG9uLm9yZy8pClshW0dVSV0oaHR0cHM6Ly9pbWcuc2hpZWxkcy5pby9iYWRnZS9HVUktUHlTaWRlNiUyMChRdDYpLTQxQ0Q1Mj9sb2dvPXF0JmxvZ29Db2xvcj13aGl0ZSldKGh0dHBzOi8vd2lraS5xdC5pby9RdF9mb3JfUHl0aG9uKQpbIVtMaW51eF0oaHR0cHM6Ly9pbWcuc2hpZWxkcy5pby9iYWRnZS9QbGF0Zm9ybS1MaW51eCUyMChVYnVudHUlMjAyMC4wNC0tMjYuMDQpLUU5NTQyMD9sb2dvPXVidW50dSZsb2dvQ29sb3I9d2hpdGUpXShodHRwczovL3VidW50dS5jb20vKQpbIVtXaW5kb3dzXShodHRwczovL2ltZy5zaGllbGRzLmlvL2JhZGdlL1BsYXRmb3JtLVdpbmRvd3MlMjAxMCU3QzExLTAwNzhEND9sb2dvPXdpbmRvd3MmbG9nb0NvbG9yPXdoaXRlKV0oaHR0cHM6Ly93d3cubWljcm9zb2Z0LmNvbS93aW5kb3dzKQpbIVtMaWNlbnNlXShodHRwczovL2ltZy5zaGllbGRzLmlvL2JhZGdlL0xpY2Vuc2UtTUlULWJsdWUuc3ZnKV0oTElDRU5TRSkKCkFuIGF1dG9ub21vdXMgZGVza3RvcCB2ZXJpZmljYXRpb24gZW5naW5lIGRlc2lnbmVkIGZvciBnZW9kZXN5IGFuZCBzZWlzbW9sb2d5IHBpcGVsaW5lcy4gQ0RETSBtb25pdG9ycyByZWFsLXRpbWUgdGVsZW1ldHJ5LCBhdWRpdHMgaGlzdG9yaWNhbCBnYXBzLCBhbmQgdmVyaWZpZXMgb2JzZXJ2YXRpb24gY29tcGxldGVuZXNzIGFjcm9zcyBOQVNBIENERElTIEdOU1MgYXJjaGl2ZXMuCgotLS0KCgpbIXRFVFIgS2V5IEZlYXR1cmVzXQoqICoqUmVhbC1UaW1lIExpdmUgVGVsZW1ldHJ5IFN0cmVhbToqKiBUcmFja3MgZGFpbHkgc2xvdCBhdmFpbGFiaWxpdHkgZnJvbSBIb3VyIDAwIHRvIGFjdGl2ZSBVVEMuCiogKipPZmZsaW5lIEdhcCBBdWRpdCBNYXRyaXggKGBw77iPwqAgR2FwIEF1ZGl0YCk6KiogQXVkaXRzIHN0YXRpb24gc3VtbWFyaWVzIGxvY2FsbHkgd2l0aG91dCByYXRlIGxpbWl0cy4KKiAqKkludGVsbGlnZW50IEdhcCBSZS1DaGVjayAoYOKGlSBSZWNoZWNrIEdhcHNgKToqKiBTa2lwcyB2ZXJpZmllZCAyNC8yNCBPSyBkYXlzLCBxdWVyeWluZyBzdHJpY3RseSBtaXNzaW5nIGRhdGVzLgoqICoqU3RyaWN0IDI0LzI0IFZlcmlmaWNhdGlvbiBTdGFuZGFyZDoqKiBFdmVyeSBob3VybHkgc2xvdCBtdXN0IGJlIGNvbmZpcm1lZCBmb3IgY29tcGxldGlvbi4KKiAqKkF1dG9tYXRlZCBEYWlseSAyNGggRmFsbGJhY2s6KiogVmVyaWZpZXMgZGFpbHkgY29tcG9zaXRlIGFpciBmaWxlcyAoYCouY3J4Lmd6KSBvbiBkcm9wcy4KKiAqKkR1YWwtUGxhdGZvcm0gRGVza3RvcCBJbnRlZ3JhdGlvbjoqKiBOYXRpdmUgbGF1bmNoZXJzIGZvciBVYnVudHUgZGVza3RvcCBhbmQgV2luZG93cyBkZXNrdG9wLgoKLS0tCgojIyDwn5K7IFN5c3RlbSBSZXF1aXJlbWVudHMKCnwgQ29tcG9uZW50IHwgTGludXggU3BlY2lmaWNhdGlvbiB8IFdpbmRvd3MgU3BlY2lmaWNhdGlvbiB8CnwgOi0tLSB8IDotLS0gfCA6LS0tIHwKfCAqKk9TKiogfCBVYnVudHUgMjAuMDTigJMyNi4wNCwgRGViaWFuIDExLzEyIHwgV2luZG93cyAxMCAvIFdpbmRvd3MgMTEgKDY0LWJpdCkgfAp8ICoqUHl0aG9uKiogfCBQeXRob24gMy44IOKAkyAzLjE0KyB8IFB5dGhvbiAzLjEwIOKAkyAzLjE0KyAoY2hlY2sgQWRkIHRvIFBBVEgpIHwKfCAqKlVJIEVuZ2luZSoqIHwgUHlTaWRlNiAoUXQ2KSB8IFB5U2lkZTYgKFF0NikgfAp8ICoqTWVtb3J5KiogfCB+NjAgTUIgYWN0aXZlIHwgfjYwIE1CIGFjdGl2ZSB8CgotLS0KCjMjIPCfmpAgUXVpY2sgU3RhcnQgJiBJbnN0YWxsYXRpb24KCjMjaCMgT3B0aW9uIEE6IExpbnV4IChVYnVudHUsIERlYmlhbiwgRmVkb3JhKQoKYGBgYmFzaAojIDEuIENsb25lIHJlcG9zaXRvcnkKZ2l0IGNsb25lIGh0dHBzOi8vZ2l0aHViLmNvbS93YXZnZW8vY2RkbS5naXQKY2QgY2RkbQoKIyAyLiBSdW4gYXV0b21hdGVkIGluc3RhbGxlcgouL2luc3RhbGwuc2gKCiMgMy4gTGF1bmNoIENERE0gTGl2ZQouL3J1bl9jZGRtLnNoCmBgYAoKPiAqKlVidW50dSBBcHAgTWVudToqKiBMYXVuY2ggZGlyZWN0bHkgZnJvbSBhcHBsaWNhdGlvbiBtZW51IGJ5IHNlYXJjaGluZyAqKkNERE0gTGl2ZSoqLgoKLS0tCgojIyMgT3B0aW9uIEI6IFdpbmRvd3MgMTAgLyAxMQoKMS4gKipQcmVyZXF1aXNpdGU6KiogSW5zdGFsbCBbUHl0aG9uIDMuMTArXShodHRwczovL3d3dy5weXRob24ub3JnL2Rvd25sb2Fkcy8pIGFuZCBjaGVjayAqKkFkZCBweXRob24uZXhlIHRvIFBBVEgqKi4KMi4gKipJbnN0YWxsYXRpb246KioKICAgKiBPcGVuIHRoZSBgY2RkbS93aW5kb3dzYCBmb2xkZXIuCiAgICogRG91YmxlLW
 
-## ⚡ Key Features
-
-* **Real-Time Live Telemetry Stream:** Tracks daily slot availability from Hour 00 to active UTC with arrival timestamps.
-* **Offline Gap Audit Matrix (`📊 Gap Audit`):** Instantly audits station summaries from local disk without querying CDDIS or triggering NASA rate limits.
-* **Intelligent Gap Re-Check (`↻ Recheck Gaps`):** Skips verified `24/24 OK` days, focusing background network requests strictly on missing or incomplete dates.
-* **Strict 24/24 Verification Standard:** Requires every single hourly slot confirmed before displaying a complete badge, preventing false positives.
-* **Automated Daily 24h Fallback:** Verifies daily composite archives (`*.crx.gz`) when real-time hourly telemetry experiences drops.
-* **Self-Healing Environment:** Resilient launcher automatically repairs Python virtual environment symlinks after major Linux distribution upgrades.
-* **Display-Aware CSV Export:** Generates missing-hours CSV reports filtered to visible records.
-
----
-
-## 💻 System Requirements
-
-| Component | Tested Specification |
-| :--- | :--- |
-| **Operating System** | Ubuntu 20.04, 22.04, 24.04, 26.04 LTS • Debian 11/12 • Fedora • Arch Linux |
-| **Python** | Python 3.8 – 3.14+ (CPython x86_64) |
-| **Display Server** | X11 and Wayland (GNOME, KDE, XFCE) |
-| **Memory** | Minimum 1 GB RAM (~60 MB active memory during scans) |
-| **Dependencies** | PySide6 (Qt6), Requests, Certifi |
-
----
-
-## 🚀 Quick Start & Installation
-
-Clone the repository and run the automated installer:
-
-```bash
-# 1. Clone repository
-git clone https://github.com/wavgeo/cddm.git
-cd cddm
-
-# 2. Run automated installer (creates virtual environment & app menu entry)
-./install.sh
-
-# 3. Launch CDDM Live
-./run_cddm.sh
-```
-
-> **Ubuntu App Menu:** Once installed, launch CDDM directly from your desktop application launcher by searching **"CDDM Live"**.
-
----
-
-## 🌐 Network & Proxy Configuration
-
-CDDM supports direct internet connections as well as university or institutional proxies:
-
-```bash
-# Configure Direct Internet or Institutional Proxy
-./set_proxy.sh
-```
-
-If you encounter authentication or SSL certificate issues on a new network:
-
-```bash
-# Run the built-in diagnostic and auto-repair utility
-bash diagnose_network.sh
-```
-
----
-
-## 📁 Repository Structure
-
-```text
-├── program/
-│   ├── cddis_monitor.py      # Core PySide6 application engine
-│   ├── cddis_icon.png        # Application desktop icon
-│   └── alert.mp3             # Notification sound asset
-├── install.sh                # Automated installer & desktop integrator
-├── run_cddm.sh               # Self-healing desktop launcher
-├── diagnose_network.sh       # Network & SSL diagnostic tool
-├── set_proxy.sh              # Interactive proxy configurator
-├── uninstall.sh              # Clean removal utility
-├── requirements.txt          # Python package specifications
-└── README.html               # Interactive documentation with constellation canvas
-```
-
----
-
-## 📄 License
-
-Distributed under the MIT License. See `README.html` for full terms.
+Available for both linux and windows.
+Visit the windows/ directory for Windows installation.
