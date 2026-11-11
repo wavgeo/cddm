@@ -1,0 +1,4 @@
+# Institutional HTTP/HTTPS Proxy Configuration
+# Leave empty or set to DIRECT for standard direct connections.
+# Example:
+# http://14.139.134.20:3128

@@ -396,7 +396,7 @@ class EarthdataSession(requests.Session):
         if cfg_proxy == "DIRECT":
             active_proxy = None
         else:
-            active_proxy = proxy_url or cfg_proxy or env_proxy or "http://192.168.101.19:3128/"
+            active_proxy = proxy_url or (cfg_proxy if cfg_proxy != "DIRECT" else None) or env_proxy or None
         if active_proxy:
             if not active_proxy.startswith("http"):
                 active_proxy = f"http://{active_proxy}"
@@ -619,9 +619,9 @@ class CheckWorker(QtCore.QThread):
                         completed_fetch += 1
                         try:
                             _state, fmap = fut.result()
-                            fetched_maps[u] = fmap
-                        except Exception:
-                            fetched_maps[u] = {}
+                            fetched_maps[u] = (_state, fmap)
+                        except Exception as e:
+                            fetched_maps[u] = ("error", {})
                         
                         pct = int((completed_fetch / total_fetch) * 100)
                         self.progress.emit(completed_fetch, total_fetch, f"Scanning CDDIS: {pct}% ({completed_fetch}/{total_fetch})")
@@ -643,7 +643,11 @@ class CheckWorker(QtCore.QThread):
 
                 slot_label = f"{slot.year} DOY {ddd_str} Hr {hh_str}" if cfg["hourly"] else f"{slot.year} DOY {ddd_str}"
                 self.log.emit(f"Scanning CDDIS: {url}")
-                file_map = fetched_maps.get(url, {})
+                fetch_res = fetched_maps.get(url, ("ok", {}))
+                if isinstance(fetch_res, tuple):
+                    f_state, file_map = fetch_res
+                else:
+                    f_state, file_map = "ok", fetch_res
 
                 for st in self.stations:
                     current_step += 1
@@ -667,10 +671,13 @@ class CheckWorker(QtCore.QThread):
                         status = "OK"
                     elif count > 0:
                         status = "PARTIAL"
-                    elif cached and cached.get("status") == "OK":
-                        # Retain previously verified OK status if current poll returned empty
-                        status = "OK"
-                        count = cached.get("files", cfg["expected"])
+                    elif cached and cached.get("status") in ("OK", "PARTIAL"):
+                        # Retain existing verified status if current remote poll failed or returned empty
+                        status = cached.get("status")
+                        count = cached.get("files", count)
+                    elif f_state != "ok":
+                        # Network error / timeout: do NOT falsely declare MISSING
+                        status = "PENDING"
                     else:
                         status = "MISSING"
 
