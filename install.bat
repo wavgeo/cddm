@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 
 title CDDM Live - Windows Installer
 echo ==========================================================
-echo            CDDM Live Windows Installation Gate            
+echo            CDDM Live Windows Installation Gate
 echo ==========================================================
 
 :: 1. Authorization check
@@ -45,13 +45,17 @@ if exist "requirements.txt" (
     venv\Scripts\pip.exe install PySide6>=6.5.0 requests>=2.28.0 certifi>=2023.5.7
 )
 
-:: 5. Create Desktop Shortcut using PowerShell
+:: 5. Convert PNG icon to Windows ICO using PySide6
+echo Generating Windows .ico icon...
+venv\Scripts\python.exe -c "from PySide6.QtGui import QImage; img = QImage(r'%~dp0program\cddis_icon.png'); img.save(r'%~dp0program\cddis_icon.ico', 'ICO')"
+
+:: 6. Create Desktop Shortcut using PowerShell
 echo Creating Windows Desktop Shortcut...
 set "TARGET=%~dp0run_cddm.bat"
-set "ICON=%~dp0program\cddis_icon.png"
-set "SHORTCUT=%USERPROFILE%\Desktop\CDDM Live.lnk"
+set "ICON=%~dp0program\cddis_icon.ico"
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "SHORTCUT=%%D\CDDM Live.lnk"
 
-powershell -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%TARGET%'; $s.WorkingDirectory = '%~dp0'; $s.Save()"
+powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%TARGET%'; $s.WorkingDirectory = '%~dp0'; if (Test-Path '%ICON%') { $s.IconLocation = '%ICON%' }; $s.Save()"
 
 echo.
 echo ==========================================================
