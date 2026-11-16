@@ -66,6 +66,17 @@ STATUS_COLORS = {
 }
 
 
+def get_app_icon():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ico_path = os.path.join(base_dir, "cddis_icon.ico")
+    png_path = os.path.join(base_dir, "cddis_icon.png")
+    if sys.platform == "win32" and os.path.exists(ico_path):
+        return QtGui.QIcon(ico_path)
+    if os.path.exists(png_path):
+        return QtGui.QIcon(png_path)
+    return create_satellite_icon()
+
+
 def create_satellite_icon(bg_color_hex="#1565c0"):
     size = 64
     pixmap = QtGui.QPixmap(size, size)
@@ -724,7 +735,7 @@ class LoginDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, is_autostart=False):
         super().__init__(parent)
         self.setWindowTitle("CDDIS Login")
-        self.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cddis_icon.png")))
+        self.setWindowIcon(get_app_icon())
         self.setMinimumWidth(450)
         self.session = None
         self.worker = None
@@ -1332,7 +1343,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, session, is_autostart=False):
         super().__init__()
         self.TIMEZONES = TIMEZONES
-        self.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cddis_icon.png")))
+        self.setWindowIcon(get_app_icon())
         QtCore.QCoreApplication.setApplicationName("CDDM")
         self.session = session
         self.is_autostart = is_autostart
@@ -1348,7 +1359,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_daily_report_date = None
 
         self.setWindowTitle("CDDM Live v1.1")
-        self.resize(1340, 890)
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            w = min(1360, max(960, avail.width() - 24))
+            h = min(840, max(620, avail.height() - 24))
+            self.setMinimumSize(940, min(600, avail.height() - 32))
+            self.resize(w, h)
+            self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
+        else:
+            self.resize(1280, 760)
 
         # 1. Build UI widgets first
         self._build_ui()
@@ -1374,7 +1394,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daily_report_timer.timeout.connect(self._check_daily_report_trigger)
         self.daily_report_timer.start(30000)
 
-        initial_icon = QtGui.QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cddis_icon.png"))
+        initial_icon = get_app_icon()
         self.setWindowIcon(initial_icon)
         self.tray = None
         if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
@@ -1394,11 +1414,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_satellite_logo(self, color_hex):
         try:
-            icon = create_satellite_icon(color_hex)
-            self.setWindowIcon(icon)
+            self.setWindowIcon(get_app_icon())
             if hasattr(self, "tray") and self.tray and self.tray.isVisible():
-                self.tray.setIcon(icon)
-        except Exception as e:
+                self.tray.setIcon(create_satellite_icon(color_hex))
+        except Exception:
             pass
 
     def _apply_icon_file(self, path):
@@ -1757,8 +1776,12 @@ International GNSS Service (IGS).
         top_split = QtWidgets.QHBoxLayout()
 
         panel = QtWidgets.QGroupBox("Monitor Configuration")
-        panel.setFixedWidth(390)
+        panel.setFixedWidth(385)
+        panel.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         form = QtWidgets.QFormLayout(panel)
+        form.setVerticalSpacing(4)
+        form.setHorizontalSpacing(8)
+        form.setContentsMargins(8, 14, 8, 6)
 
         self.type_box = QtWidgets.QComboBox()
         self.type_box.addItems(DATA_TYPES.keys())
@@ -1772,7 +1795,7 @@ International GNSS Service (IGS).
         stn_h_layout.setSpacing(6)
 
         self.stations = QtWidgets.QLineEdit()
-        self.stations.setFixedHeight(28)
+        self.stations.setFixedHeight(24)
         self.stations.setPlaceholderText("Enter 4-char IDs (e.g. IISC, IITK)")
         self.stations.setText(self.settings.value("stations", "IISC"))
         self._last_synced_stns = self.stations.text().strip()
@@ -1780,7 +1803,7 @@ International GNSS Service (IGS).
         self.btn_sync_stns = QtWidgets.QPushButton("⟳ Sync")
         self.btn_sync_stns.setToolTip("Sync and audit newly added stations immediately")
         self.btn_sync_stns.setFixedWidth(64)
-        self.btn_sync_stns.setFixedHeight(28)
+        self.btn_sync_stns.setFixedHeight(24)
         self.btn_sync_stns.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.btn_sync_stns.setStyleSheet("""
             QPushButton {
@@ -1810,8 +1833,8 @@ International GNSS Service (IGS).
         self.stations.textEdited.connect(_on_txt_change)
         st_container.addLayout(stn_h_layout)
 
-        self.mode_live = QtWidgets.QRadioButton("Live Today (00..Now UTC)")
-        self.mode_doy = QtWidgets.QRadioButton("Specific Julian Day")
+        self.mode_live = QtWidgets.QRadioButton("Live Today (UTC)")
+        self.mode_doy = QtWidgets.QRadioButton("Specific DOY")
         self.mode_live.setChecked(True)
         mode_box = QtWidgets.QHBoxLayout()
         mode_box.addWidget(self.mode_live)
@@ -1900,7 +1923,7 @@ International GNSS Service (IGS).
         form.addRow("Station Folders Root", path_box)
 
         self.start_stop_btn = QtWidgets.QPushButton("▶ Start Monitoring")
-        self.start_stop_btn.setFixedHeight(34)
+        self.start_stop_btn.setFixedHeight(28)
         self.start_stop_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2e7d32;
@@ -1918,12 +1941,15 @@ International GNSS Service (IGS).
         self.check_btn.clicked.connect(self.run_check)
 
         self.export_btn = QtWidgets.QPushButton("Export Results to CSV")
+        self.export_btn.setFixedHeight(25)
         self.export_btn.clicked.connect(self.export_csv)
 
         self.clear_btn = QtWidgets.QPushButton("Clear Alerts")
+        self.clear_btn.setFixedHeight(25)
         self.clear_btn.clicked.connect(self._handle_clear_alerts)
 
         self.about_btn = QtWidgets.QPushButton("Help & Documentation")
+        self.about_btn.setFixedHeight(25)
         self.about_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.about_btn.setStyleSheet("""
             QPushButton {
@@ -2295,7 +2321,9 @@ International GNSS Service (IGS).
         # Properly assemble layout hierarchy into top_split and root_v
         top_split.addWidget(panel)
         top_split.addLayout(right, 1)
-        root_v.addLayout(top_split, 1)
+        root_v.setContentsMargins(8, 6, 8, 6)
+        root_v.setSpacing(6)
+        root_v.addLayout(top_split, 3)
 
         doy_strip_group = QtWidgets.QGroupBox("Archive History")
         doy_strip_v = QtWidgets.QVBoxLayout(doy_strip_group)
@@ -2366,7 +2394,7 @@ International GNSS Service (IGS).
 
         self.doy_scroll = QtWidgets.QScrollArea()
         self.doy_scroll.setWidgetResizable(True)
-        self.doy_scroll.setFixedHeight(62)
+        self.doy_scroll.setFixedHeight(54)
         self.doy_scroll.setStyleSheet("""
             QScrollArea {
                 background-color: #f8f9fa;
@@ -2405,6 +2433,7 @@ International GNSS Service (IGS).
             }
         """)
         bottom_layout.addWidget(self.logbox)
+        bottom_box.setMaximumHeight(140)
         root_v.addWidget(bottom_box, 1)
 
         self.statusBar().showMessage("Ready.")
@@ -2872,7 +2901,7 @@ International GNSS Service (IGS).
                     background-color: #2e7d32;
                     color: white;
                     font-weight: bold;
-                    padding: 8px;
+                    padding: 4px;
                     border-radius: 4px;
                 }
                 QPushButton:hover {
@@ -3114,7 +3143,7 @@ International GNSS Service (IGS).
                         background-color: #c62828 if self.is_monitoring else #2e7d32;
                         color: white;
                         font-weight: bold;
-                        padding: 8px;
+                        padding: 4px;
                         border-radius: 4px;
                     }
                 """)
@@ -3131,7 +3160,7 @@ International GNSS Service (IGS).
                         background-color: #1976D2;
                         color: white;
                         font-weight: bold;
-                        padding: 8px;
+                        padding: 4px;
                         border-radius: 4px;
                     }
                     QPushButton:hover {
@@ -4118,13 +4147,17 @@ International GNSS Service (IGS).
 def main():
     is_autostart = "--autostart" in sys.argv
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("csir.4pi.cddm.live.1.1")
+        except Exception:
+            pass
     sys.argv[0] = "cddm"
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setDesktopFileName("cddm")
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cddis_icon.png")
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QtGui.QIcon(icon_path))
+    app.setWindowIcon(get_app_icon())
     app.setApplicationName("CDDM Live v1.1")
 
     settings = QtCore.QSettings("gnss-tools", "cddis-monitor")
