@@ -885,11 +885,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.vol_slider.valueChanged.connect(self._on_vol_changed)
         self.test_sound_btn.clicked.connect(self._toggle_test_sound)
 
-        # Autostart Option
-        self.autostart_cb = QtWidgets.QCheckBox("Start automatically on system login (Linux)")
+        # Autostart Option (Cross-Platform Linux & Windows)
+        os_label = "Windows" if sys.platform == "win32" else "Linux"
+        self.autostart_cb = QtWidgets.QCheckBox(f"Start automatically on system login ({os_label})")
         self.autostart_cb.setStyleSheet("font-size: 12px; color: #212529;")
-        # Check ~/.config/autostart existence as ground truth, or fallback to QSettings
-        autostart_file = os.path.expanduser("~/.config/autostart/cddis_monitor.desktop")
+        if sys.platform == "win32":
+            autostart_file = os.path.join(
+                os.environ.get("APPDATA", ""),
+                "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "CDDM Live.lnk"
+            )
+        else:
+            autostart_file = os.path.expanduser("~/.config/autostart/cddis_monitor.desktop")
         is_enabled = os.path.exists(autostart_file) or self.settings.value("autostart", True, type=bool)
         self.autostart_cb.setChecked(is_enabled)
         layout.addWidget(self.autostart_cb)
@@ -928,14 +934,46 @@ class SettingsDialog(QtWidgets.QDialog):
     def save_and_close(self):
         enabled = self.autostart_cb.isChecked()
         self.settings.setValue("autostart", enabled)
-        install_linux_autostart(enabled)
+        self.settings.sync()
+        if sys.platform == "win32":
+            try:
+                startup_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+                lnk_path = os.path.join(startup_dir, "CDDM Live.lnk")
+                if not enabled:
+                    if os.path.exists(lnk_path):
+                        os.remove(lnk_path)
+                elif os.path.isdir(startup_dir):
+                    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    pyw = os.path.join(root_dir, "venv", "Scripts", "pythonw.exe")
+                    script = os.path.abspath(__file__)
+                    ico = os.path.join(os.path.dirname(script), "cddis_icon.ico")
+                    if os.path.exists(pyw):
+                        ps_cmd = (
+                            f"$ws = New-Object -ComObject WScript.Shell; "
+                            f"$s = $ws.CreateShortcut('{lnk_path}'); "
+                            f"$s.TargetPath = '{pyw}'; "
+                            f"$s.Arguments = '\"{script}\" --autostart'; "
+                            f"$s.WorkingDirectory = '{root_dir}'; "
+                            f"if (Test-Path '{ico}') {{ $s.IconLocation = '{ico}' }}; "
+                            f"$s.Save()"
+                        )
+                        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True)
+            except Exception:
+                pass
+        else:
+            install_linux_autostart(enabled)
 
         # Save Audio Settings
         self.settings.setValue("sound_alerts_enabled", self.sound_alerts_cb.isChecked())
         self.settings.setValue("sound_volume", self.vol_slider.value())
         parent = self.parent()
-        if parent and hasattr(parent, "audio_output"):
-            parent.audio_output.setVolume(self.vol_slider.value() / 100.0)
+        if parent:
+            if hasattr(parent, "audio_output"):
+                parent.audio_output.setVolume(self.vol_slider.value() / 100.0)
+            if hasattr(parent, "sound_chk"):
+                parent.sound_chk.blockSignals(True)
+                parent.sound_chk.setChecked(self.sound_alerts_cb.isChecked())
+                parent.sound_chk.blockSignals(False)
 
         self.accept()
 
@@ -1348,9 +1386,17 @@ class CustomScanWorker(QtCore.QThread):
                 )
             f.write("=" * 110 + "\n")
 
-    def _write_total_summary(self, summary_path, day_records, audit_notes=None, start_dt=None, end_dt=None):
+    def _write_total_summary(self, summary_path, day_records, audit_notes=None, start_dt=None, end_dt=None, file_stats=None):
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
         merged_list = sorted(day_records, key=lambda r: (r["year"], r["doy"], r["station"]))
+        total_expected = sum(r.get("total_cnt", 0) for r in merged_list)
+        final_avail = sum(r.get("ok_cnt", 0) for r in merged_list)
+        final_missed = max(0, total_expected - final_avail)
+
+        init_avail = file_stats.get("initial_available", final_avail) if file_stats else final_avail
+        init_missed = file_stats.get("initial_missed", final_missed) if file_stats else final_missed
+        recovered_missed = file_stats.get("recovered_missed", max(0, final_avail - init_avail)) if file_stats else max(0, final_avail - init_avail)
+
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("=" * 115 + "\n")
             f.write("NASA CDDIS GNSS ARCHIVE - CONSOLIDATED CUSTOM SCAN SUMMARY\n")
@@ -1365,6 +1411,12 @@ class CustomScanWorker(QtCore.QThread):
                 dur_str = f"{hrs:02d}h {mins:02d}m {secs:02d}s ({elapsed_s:.1f}s)" if hrs else f"{mins:02d}m {secs:02d}s ({elapsed_s:.1f}s)"
                 f.write(f"Scan Duration : Start: {start_dt:%Y-%m-%d %H:%M:%S} | End: {end_dt:%Y-%m-%d %H:%M:%S} | Total Duration: {dur_str}\n")
             f.write(f"Updated on    : {dt.datetime.now():%Y-%m-%d %H:%M:%S} Local Time\n")
+            f.write("-" * 115 + "\n")
+            f.write(f"Total Expected Files               : {total_expected}\n")
+            f.write(f"Available Files (Initial Scan)     : {init_avail}\n")
+            f.write(f"Missed Files (Initial Scan)        : {init_missed}\n")
+            f.write(f"CDDIS Available Missed (Recovered) : {recovered_missed}\n")
+            f.write(f"Final Available / Remaining Missed : {final_avail} / {final_missed}\n")
             f.write("=" * 115 + "\n\n")
             f.write(f"{'Year':<6} {'DOY':<5} {'Date (UTC)':<12} {'Station':<9} {'Status':<10} {'OK/Tot':<8} {'Missing Slots'}\n")
             f.write("-" * 115 + "\n")
@@ -1474,12 +1526,27 @@ class CustomScanWorker(QtCore.QThread):
         completed_tasks = 0
         day_records = []
         rows_by_key = {}
+        day_dir_maps = {}
         day_to_uncached = {}
         records_lock = threading.Lock()
+        initial_stats_snap = {}
 
         os.makedirs(self.out_dir, exist_ok=True)
         summary_path = os.path.join(self.out_dir, "CUSTOM_SCAN_TOTAL_SUMMARY.txt")
         years_in_scan = sorted({y for (y, _) in self.date_list})
+
+        def _build_yr_stats(yr, overall_stats):
+            if not overall_stats:
+                return None
+            yr_init = overall_stats.get("by_year_init", {}).get(yr)
+            if not yr_init:
+                return None
+            yr_final_avail = sum(r.get("ok_cnt", 0) for r in day_records if r["year"] == yr)
+            return {
+                "initial_available": yr_init["avail"],
+                "initial_missed": yr_init["missed"],
+                "recovered_missed": max(0, yr_final_avail - yr_init["avail"]),
+            }
 
         def _flush_summaries(audit_notes=None):
             with records_lock:
@@ -1487,8 +1554,16 @@ class CustomScanWorker(QtCore.QThread):
             if not snap:
                 return
             now_dt = dt.datetime.now()
+            f_stats = None
+            if initial_stats_snap:
+                cur_avail = sum(r.get("ok_cnt", 0) for r in snap)
+                f_stats = {
+                    "initial_available": initial_stats_snap["avail"],
+                    "initial_missed": initial_stats_snap["missed"],
+                    "recovered_missed": max(0, cur_avail - initial_stats_snap["avail"]),
+                }
             self._write_total_summary(
-                summary_path, snap, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt
+                summary_path, snap, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt, file_stats=f_stats
             )
             if len(years_in_scan) > 1:
                 for yr in years_in_scan:
@@ -1496,7 +1571,8 @@ class CustomScanWorker(QtCore.QThread):
                     if yr_recs:
                         yr_sum_path = os.path.join(self.out_dir, str(yr), f"CUSTOM_SCAN_{yr}_SUMMARY.txt")
                         self._write_total_summary(
-                            yr_sum_path, yr_recs, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt
+                            yr_sum_path, yr_recs, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt,
+                            file_stats=_build_yr_stats(yr, initial_stats_snap)
                         )
 
         try:
@@ -1527,6 +1603,8 @@ class CustomScanWorker(QtCore.QThread):
                     if self.isInterruptionRequested():
                         return
                     d_str = (dt.date(y, 1, 1) + dt.timedelta(days=d - 1)).strftime("%Y-%m-%d")
+                    with records_lock:
+                        day_dir_maps[(y, d)] = dict(dir_maps)
                     for st in st_list:
                         st_rows = self._build_rows_from_dir_maps(cfg, y, d, st, dir_maps)
                         self._write_station_doy_report(y, d, st, st_rows)
@@ -1552,28 +1630,109 @@ class CustomScanWorker(QtCore.QThread):
                     sess, cfg, day_to_uncached, phase_label="Scanning", on_day_complete=_commit_completed_day
                 )
 
+            # Snapshot initial scan file totals before post-scan gap retry
+            with records_lock:
+                init_tot = sum(r.get("total_cnt", 0) for r in day_records)
+                init_ok = sum(r.get("ok_cnt", 0) for r in day_records)
+                by_yr = {}
+                for yr in years_in_scan:
+                    yt = sum(r.get("total_cnt", 0) for r in day_records if r["year"] == yr)
+                    yo = sum(r.get("ok_cnt", 0) for r in day_records if r["year"] == yr)
+                    by_yr[yr] = {"avail": yo, "missed": max(0, yt - yo)}
+                initial_stats_snap.update({
+                    "total": init_tot,
+                    "avail": init_ok,
+                    "missed": max(0, init_tot - init_ok),
+                    "by_year_init": by_yr,
+                })
+
             _flush_summaries()
 
             audit_notes = []
             if self.auto_audit and not self.isInterruptionRequested() and day_records:
+                # Collect ONLY the specific missed (year, doy, hour_int) slots across incomplete days
+                missed_slot_to_stns = {}
                 audit_day_to_stns = {}
                 with records_lock:
                     for rec in day_records:
                         if rec["status"] in ("PARTIAL", "MISSING") or rec["ok_cnt"] < rec["total_cnt"]:
-                            audit_day_to_stns.setdefault((rec["year"], rec["doy"]), []).append(rec["station"])
+                            gy, gd, gst = rec["year"], rec["doy"], rec["station"]
+                            audit_day_to_stns.setdefault((gy, gd), []).append(gst)
+                            st_rows = rows_by_key.get((gy, gd, gst), [])
+                            for r in st_rows:
+                                if r["status"] != "OK":
+                                    h_int = int(r["hour_str"])
+                                    missed_slot_to_stns.setdefault((gy, gd, h_int), set()).add(gst)
 
-                if not audit_day_to_stns:
+                if not missed_slot_to_stns:
                     audit_notes.append("Audit verified 0 gaps across all scanned station-days.")
                 else:
-                    self.progress.emit(0, len(audit_day_to_stns), f"Audit Retry running across {len(audit_day_to_stns)} day(s)…")
-                    retry_maps = self._fetch_all_days_pipelined(sess, cfg, audit_day_to_stns, phase_label="Audit Retry")
+                    ordered_slots = sorted(missed_slot_to_stns.keys())
+                    total_retry_slots = len(ordered_slots)
+                    self.progress.emit(0, total_retry_slots, f"Targeted Audit Retry: checking {total_retry_slots} missed slot(s) only…")
+
+                    # Signal UI rows for days undergoing targeted slot retry
                     for (gy, gd), gst_list in sorted(audit_day_to_stns.items()):
-                        d_maps = retry_maps.get((gy, gd), {})
+                        for gst in gst_list:
+                            self.row_scanning.emit(gy, gd, gst, "Retrying missed slots…")
+
+                    tls_retry = threading.local()
+                    def _get_retry_sess():
+                        if not hasattr(tls_retry, "s"):
+                            creds = getattr(sess, "auth_creds", None) or (None, None)
+                            s = requests.Session()
+                            s.trust_env = True
+                            adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
+                            s.mount("https://", adapter)
+                            s.mount("http://", adapter)
+                            if getattr(sess, "auth", None):
+                                s.auth = sess.auth
+                            elif creds[0] and creds[1]:
+                                from requests.auth import HTTPBasicAuth
+                                s.auth = HTTPBasicAuth(creds[0], creds[1])
+                            if getattr(sess, "proxies", None):
+                                s.proxies.update(sess.proxies)
+                            if hasattr(sess, "cookies"):
+                                for ck in sess.cookies:
+                                    s.cookies.set_cookie(ck)
+                            tls_retry.s = s
+                        return tls_retry.s
+
+                    def _retry_slot_worker(slot_key):
+                        if self.isInterruptionRequested():
+                            return slot_key, {}
+                        y, d, h = slot_key
+                        hh_str = f"{h:02d}"
+                        url = f"{BASE}/" + cfg["path"].format(Y=y, DDD=f"{d:03d}", yy=f"{y % 100:02d}", HH=hh_str)
+                        _, fmap = list_dir(_get_retry_sess(), url)
+                        return (y, d, hh_str), fmap
+
+                    done_retry = 0
+                    with ThreadPoolExecutor(max_workers=8) as r_pool:
+                        r_futs = [r_pool.submit(_retry_slot_worker, sk) for sk in ordered_slots]
+                        for fut in as_completed(r_futs):
+                            if self.isInterruptionRequested():
+                                for pf in r_futs:
+                                    pf.cancel()
+                                break
+                            (ry, rd, rhh), rfmap = fut.result()
+                            done_retry += 1
+                            with records_lock:
+                                day_dir_maps.setdefault((ry, rd), {})[rhh] = rfmap
+                            self.progress.emit(
+                                done_retry, total_retry_slots,
+                                f"Audit Retry {ry}-DOY{rd:03d} Hr {rhh} ({done_retry}/{total_retry_slots} missed slots)"
+                            )
+
+                    # Re-evaluate only the days that had missed slots
+                    for (gy, gd), gst_list in sorted(audit_day_to_stns.items()):
+                        with records_lock:
+                            merged_d_maps = dict(day_dir_maps.get((gy, gd), {}))
                         for gst in gst_list:
                             with records_lock:
                                 old_rows = rows_by_key.get((gy, gd, gst), [])
                             old_ok = sum(1 for r in old_rows if r["status"] == "OK")
-                            refreshed_rows = self._build_rows_from_dir_maps(cfg, gy, gd, gst, d_maps)
+                            refreshed_rows = self._build_rows_from_dir_maps(cfg, gy, gd, gst, merged_d_maps)
                             new_ok = sum(1 for r in refreshed_rows if r["status"] == "OK")
                             if new_ok > old_ok:
                                 self._write_station_doy_report(gy, gd, gst, refreshed_rows)
@@ -1589,6 +1748,11 @@ class CustomScanWorker(QtCore.QThread):
                                             self.row_ready.emit(dict(rec))
                                 note = f"[RECOVERED] {gst} {gy}-DOY{gd:03d}: {old_ok}/{len(refreshed_rows)} -> {new_ok}/{len(refreshed_rows)}"
                             else:
+                                # Re-emit row so table status resets cleanly from "Retrying missed slots…" back to PARTIAL/MISSING
+                                with records_lock:
+                                    for rec in day_records:
+                                        if rec["year"] == gy and rec["doy"] == gd and rec["station"] == gst:
+                                            self.row_ready.emit(dict(rec))
                                 note = f"[UNCHANGED] {gst} {gy}-DOY{gd:03d}: {new_ok}/{len(refreshed_rows)} available on CDDIS."
                             audit_notes.append(note)
                             self.log.emit(note)
@@ -1602,50 +1766,6 @@ class CustomScanWorker(QtCore.QThread):
 
         self.progress.emit(total_tasks, total_tasks, "Completed")
         self.finished_all.emit(summary_path, day_records)
-
-
-class ArchiveGapAnalyzerDialog(QtWidgets.QDialog):
-    def __init__(self, parent, root_dir, stations, year):
-        super().__init__(parent)
-        self.setWindowTitle("Offline Archive Gap Audit")
-        self.resize(780, 520)
-        lay = QtWidgets.QVBoxLayout(self)
-        tbl = QtWidgets.QTableWidget(0, 4)
-        tbl.setHorizontalHeaderLabels(["Station", "DOY", "Status", "Details"])
-        tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        now_doy = dt.datetime.now(dt.timezone.utc).timetuple().tm_yday
-        for st in stations:
-            for d in range(max(1, now_doy - 30), now_doy):
-                fp = get_station_doy_filepath(root_dir, st, year, d)
-                state, det = parse_single_summary_file(fp)
-                r = tbl.rowCount()
-                tbl.insertRow(r)
-                for c, val in enumerate([st, f"{d:03d}", state.upper(), det]):
-                    tbl.setItem(r, c, QtWidgets.QTableWidgetItem(val))
-        lay.addWidget(tbl)
-        btn = QtWidgets.QPushButton("Close")
-        btn.clicked.connect(self.accept)
-        lay.addWidget(btn)
-
-
-class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle("CDDM Preferences")
-        self.resize(400, 180)
-        s = QtCore.QSettings("gnss-tools", "cddis-monitor")
-        lay = QtWidgets.QVBoxLayout(self)
-        chk_auto = QtWidgets.QCheckBox("Launch automatically on Linux desktop login")
-        chk_auto.setChecked(s.value("autostart", True, type=bool))
-        lay.addWidget(chk_auto)
-        btn_save = QtWidgets.QPushButton("Save & Close")
-        def _save():
-            s.setValue("autostart", chk_auto.isChecked())
-            s.sync()
-            install_linux_autostart(chk_auto.isChecked())
-            self.accept()
-        btn_save.clicked.connect(_save)
-        lay.addWidget(btn_save)
 
 
 class StationProbeWorker(QtCore.QThread):
