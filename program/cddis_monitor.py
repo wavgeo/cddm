@@ -1700,6 +1700,12 @@ class CustomScanDialog(QtWidgets.QDialog):
         self.worker = None
         self._active_row_idx = None
         self._pulse_phase = 0
+        self.setWindowFlags(
+            QtCore.Qt.Window
+            | QtCore.Qt.WindowMinimizeButtonHint
+            | QtCore.Qt.WindowMaximizeButtonHint
+            | QtCore.Qt.WindowCloseButtonHint
+        )
         self.setWindowTitle("Custom Archive Scan & Post-Audit")
         self.resize(960, 680)
 
@@ -3777,14 +3783,23 @@ International GNSS Service (IGS).
         dlg.exec()
 
     def open_custom_scan_dialog(self):
-        dlg = CustomScanDialog(
-            self,
+        existing = getattr(self, "_custom_scan_dlg", None)
+        if existing is not None and existing.isVisible():
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._custom_scan_dlg = CustomScanDialog(
+            None,
             self.session,
             default_stations=self.stations.text().strip(),
             default_dtype=self.type_box.currentText(),
             default_out_dir=self.report_path.text().strip()
         )
-        dlg.exec()
+        self._custom_scan_dlg.setWindowIcon(self.windowIcon())
+        self._custom_scan_dlg.show()
+        self._custom_scan_dlg.raise_()
+        self._custom_scan_dlg.activateWindow()
 
     def open_gap_analyzer(self):
         target_dir = self.report_path.text().strip() or os.path.expanduser("~/cddis_reports")
