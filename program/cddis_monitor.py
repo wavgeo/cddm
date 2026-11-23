@@ -500,12 +500,13 @@ def list_dir(session, url):
 
 
 class LoginWorker(QtCore.QThread):
-    finished_auth = QtCore.Signal(bool, str, str, object)
+    finished_auth = QtCore.Signal(bool, str, str)
 
     def __init__(self, username, password, parent=None):
         super().__init__(parent)
         self.username = username
         self.password = password
+        self.result_session = None
 
     def __del__(self):
         try:
@@ -524,42 +525,38 @@ class LoginWorker(QtCore.QThread):
             if "urs.earthdata.nasa.gov" in r.url and "/oauth/authorize" in r.url:
                 self.finished_auth.emit(
                     False, "auth",
-                    "Authentication error: Authorize 'CDDIS' in your Earthdata profile.",
-                    None
+                    "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
                 )
                 return
 
             if r.status_code in (401, 403):
                 self.finished_auth.emit(
                     False, "auth",
-                    "Incorrect username or password.",
-                    None
+                    "Incorrect username or password."
                 )
                 return
 
             if r.status_code != 200:
                 self.finished_auth.emit(
                     False, "network",
-                    f"Server returned unexpected HTTP {r.status_code}.",
-                    None
+                    f"Server returned unexpected HTTP {r.status_code}."
                 )
                 return
 
-            self.finished_auth.emit(True, "ok", "Connected successfully.", sess)
+            self.result_session = sess
+            self.finished_auth.emit(True, "ok", "Connected successfully.")
         except requests.exceptions.Timeout:
             self.finished_auth.emit(
                 False, "network",
-                "Connection timed out. CDDIS server took too long to respond.",
-                None
+                "Connection timed out. CDDIS server took too long to respond."
             )
         except requests.exceptions.ConnectionError:
             self.finished_auth.emit(
                 False, "network",
-                "Network connection error. Waiting for internet...",
-                None
+                "Network connection error. Waiting for internet..."
             )
         except Exception as e:
-            import traceback; err_detail = traceback.format_exc(); self.finished_auth.emit(False, "network", f"Err: {str(e)} | {type(e).__name__}", None)
+            self.finished_auth.emit(False, "network", f"Err: {str(e)} | {type(e).__name__}")
 
 class LoginDialog(QtWidgets.QDialog):
     MAX_BOOT_RETRIES = 12
@@ -747,8 +744,9 @@ class LoginDialog(QtWidgets.QDialog):
         self.worker.finished_auth.connect(self.on_login_finished)
         self.worker.start()
 
-    def on_login_finished(self, success, err_type, message, session):
+    def on_login_finished(self, success, err_type, message):
         if success:
+            session = getattr(self.worker, "result_session", None)
             self.retry_timer.stop()
             s = QtCore.QSettings("gnss-tools", "cddis-monitor")
             s.setValue("username", self.user.text().strip())
@@ -3215,11 +3213,18 @@ class ConnectionCheckWorker(QtCore.QThread):
                 w.quit()
                 w.wait(1500)
 
-        # 3. Wipe saved credentials & auto-login flags from QSettings
+        # 3. Wipe saved credentials, auto-login flags, and disk cookie jar
         s = QtCore.QSettings("gnss-tools", "cddis-monitor")
         s.setValue("auto_login", False)
         s.remove("password")
         s.setValue("remember", False)
+        s.sync()
+        try:
+            cookie_path = os.path.expanduser("~/.cddis_cookies.txt")
+            if os.path.exists(cookie_path):
+                os.remove(cookie_path)
+        except Exception:
+            pass
 
         # 4. Remove Earthdata entries from ~/.netrc if present
         try:
@@ -3689,7 +3694,7 @@ International GNSS Service (IGS).
         self.conn_pill_btn.setToolTip("Click to open Connection Troubleshooter & Session Repair")
         self.conn_pill_btn.clicked.connect(self.open_connection_troubleshooter)
         menubar.setCornerWidget(self.conn_pill_btn, QtCore.Qt.TopRightCorner)
-        self._set_conn_pill_state("checking", "Checking CDDIS…")
+        self._set_conn_pill_state("connected", "CDDIS Connected")
 
         # Background heartbeat every 10 minutes + initial check
         self._conn_heartbeat_timer = QtCore.QTimer(self)
@@ -5106,6 +5111,7 @@ International GNSS Service (IGS).
         self._save_settings()
         self.log("Application closed.")
         super().closeEvent(event)
+        QtWidgets.QApplication.exit(0)
     def _hourly(self):
         return DATA_TYPES[self.type_box.currentText()]["hourly"]
 
@@ -5655,6 +5661,13 @@ International GNSS Service (IGS).
             pass
 
     def on_slot_checked(self, r):
+        _st = str(r.get("status", "")).upper()
+        if _st in ("OK", "PENDING", "MISSING"):
+            self._set_conn_pill_state("connected", "CDDIS Connected")
+        elif "AUTH" in _st or "EXPIRED" in _st:
+            self._set_conn_pill_state("expired", "Session Expired")
+        elif "ERR" in _st or "OFFLINE" in _st or "TIMEOUT" in _st:
+            self._set_conn_pill_state("offline", "Connection Error")
         hh = r["slot"].hour if hasattr(r["slot"], "hour") else 0
         self.hb_led.setStyleSheet("color: #ff9500; font-size: 13px; border: none; background: transparent;")
         self.hb_label.setText(f"Scanning Hr {hh:02d} ({r.get('station', '')})...")
@@ -6232,10 +6245,11 @@ def main():
         saved_user = settings.value("username", "")
         saved_pass = settings.value("password", "")
 
-        # Try automatic silent authentication if credentials exist and auto_login is active
+        # Try automatic silent authentication ONLY if auto_login is active AND a saved password exists
         if auto_login and saved_user and saved_pass:
             try:
-                test_sess = EarthdataSession(saved_user, saved_pass)
+                decoded_pw = base64.b64decode(saved_pass.encode()).decode()
+                test_sess = EarthdataSession(saved_user, decoded_pw)
                 r = test_sess.get(f"{BASE}/daily/", timeout=25, allow_redirects=True)
                 if r.status_code == 200 and "urs.earthdata.nasa.gov" not in r.url:
                     session = test_sess
