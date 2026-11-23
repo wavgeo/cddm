@@ -573,6 +573,28 @@ cd CDDM</code></pre>
 
   </div>
 
+  
+    <div style="max-width: 900px; margin: 36px auto 0 auto; text-align: left;">
+      <h2 style="color: #f8fafc; font-size: 1.35rem; margin-bottom: 10px;">Custom Archive Scan &amp; Post-Audit Tool</h2>
+      <p style="color: #94a3b8; font-size: 0.95rem; margin-bottom: 16px;">
+        Click <strong style="color: #e2e8f0;">Custom Scan</strong> in the top header bar to audit historical DOYs or cross-year ranges independently of the live monitor:
+      </p>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; padding: 12px 16px; color: #cbd5e1; font-size: 0.9rem;">
+          <strong style="color: #38bdf8;">Station Availability Probe:</strong> Click <em>Check Station Availability</em> to probe a recent baseline DOY on CDDIS and verify whether each station publishes the selected data stream (flagging Daily-only vs. Hourly stations).
+        </div>
+        <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; padding: 12px 16px; color: #cbd5e1; font-size: 0.9rem;">
+          <strong style="color: #38bdf8;">Particular DOYs &amp; Multi-Year Ranges:</strong> Target specific DOYs (e.g., <code style="color: #7dd3fc;">120, 125, 130-135</code>) or a full <code style="color: #7dd3fc;">From Year/DOY &rarr; To Year/DOY</code> span.
+        </div>
+        <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; padding: 12px 16px; color: #cbd5e1; font-size: 0.9rem;">
+          <strong style="color: #38bdf8;">Pipelined Engine &amp; Throttle Guard:</strong> Fetches each CDDIS directory once across all selected stations via 4 keep-alive gzip workers with automatic rate-limit backoff and disk-cache skipping for already verified <code style="color: #4ade80;">COMPLETE</code> days.
+        </div>
+        <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; padding: 12px 16px; color: #cbd5e1; font-size: 0.9rem;">
+          <strong style="color: #38bdf8;">Consolidated Summary &amp; Automatic Gap Audit:</strong> Saves per-station <code style="color: #7dd3fc;">&lt;DOY&gt;.txt</code> reports (separated into <code style="color: #7dd3fc;">&lt;YEAR&gt;/&lt;STATION&gt;/</code> folders for multi-year scans) plus <code style="color: #7dd3fc;">CUSTOM_SCAN_TOTAL_SUMMARY.txt</code> with start/end timestamps, total duration, and automatic post-scan retry recovery for incomplete days.
+        </div>
+      </div>
+    </div>
+
   <footer>
     <p>Copyright &copy; 2026 CDDM Live. All rights reserved.</p>
   </footer>
@@ -691,6 +713,5 @@ cd CDDM</code></pre>
     initNodes();
     animate();
   </script>
-
 </body>
 </html>

@@ -98,3 +98,16 @@ cd cddm
 ## 📄 License
 
 Distributed under the MIT License.
+
+## Custom Archive Scan & Post-Audit Tool
+
+Click **Custom Scan** in the top header bar to open the dedicated historical audit dialog without interrupting live monitoring:
+
+- **Station & File Type Verification (`Check Station Availability`):** Probes a recent completed baseline DOY on NASA CDDIS in the background to verify whether each entered station exists on CDDIS and publishes the selected stream (distinguishing Hourly-capable stations from Daily-only stations).
+- **Flexible Date Selection:** Scan either **particular DOY(s)** within a year (comma-separated or ranges such as `120, 125, 130-135`) or a continuous **multi-year range** (`From Year / DOY` → `To Year / DOY`).
+- **High-Throughput Pipelined Scanning with Throttle Protection:** Uses a 4-worker gzip-enabled pipeline with shared directory caching across stations and cooperative exponential backoff (`[THROTTLE GUARD]`) so multi-station, multi-day scans run rapidly without triggering CDDIS rate limits.
+- **Structured Output & Multi-Year Folder Separation:**
+  - Single-year scans write per-station summaries to `<Output_Folder>/<STATION>/<DOY>.txt`.
+  - Multi-year scans automatically separate reports by year (`<Output_Folder>/<YEAR>/<STATION>/<DOY>.txt`) to prevent DOY collisions.
+  - Generates a consolidated **`CUSTOM_SCAN_TOTAL_SUMMARY.txt`** tracking every scanned station-day alongside total scan start time, end time, and elapsed duration.
+- **Automated Post-Scan Gap Audit & Retry:** Automatically parses `CUSTOM_SCAN_TOTAL_SUMMARY.txt` after the initial scan, re-queries CDDIS for every `PARTIAL`, `MISSING`, or `THROTTLED` station-day, rewrites updated `<DOY>.txt` files if missing files are recovered, and appends a recovery audit log to the consolidated summary.
