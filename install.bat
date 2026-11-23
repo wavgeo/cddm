@@ -19,6 +19,18 @@ echo.
 echo [OK] Authorized. Proceeding with installation...
 echo ==========================================================
 
+cd /d "%~dp0"
+
+:: Load optional institutional proxy from proxy.conf if present
+if exist "proxy.conf" (
+    for /f "usebackq tokens=1,* delims==" %%A in ("proxy.conf") do (
+        set "KEY=%%A"
+        if /i "!KEY!"=="HTTP_PROXY" set "HTTP_PROXY=%%B"
+        if /i "!KEY!"=="HTTPS_PROXY" set "HTTPS_PROXY=%%B"
+    )
+    if defined HTTPS_PROXY echo [INFO] Using proxy from proxy.conf: !HTTPS_PROXY!
+)
+
 :: 2. Check for Python
 where python >nul 2>nul
 if %errorlevel% neq 0 (
@@ -29,7 +41,6 @@ if %errorlevel% neq 0 (
 )
 
 :: 3. Setup Virtual Environment
-cd /d "%~dp0"
 if not exist "venv\Scripts\python.exe" (
     echo Creating virtual environment...
     python -m venv venv
@@ -44,7 +55,7 @@ if not exist "venv\Scripts\python.exe" (
 echo Installing Python dependencies (PySide6, requests, certifi)...
 venv\Scripts\python.exe -m pip install --upgrade pip
 if !errorlevel! neq 0 (
-    echo [ERROR] Failed to upgrade pip. Check your internet connection.
+    echo [ERROR] Failed to upgrade pip. Check your internet or proxy.conf settings.
     pause
     exit /b 1
 )
@@ -61,15 +72,8 @@ if !errorlevel! neq 0 (
     exit /b 1
 )
 
-:: 5. Optional Icon Setup (Safe fallback)
-echo Configuring application icon...
-set "ICON_PATH=%~dp0program\cddis_ico.ico"
-if not exist "%ICON_PATH%" (
-    set "ICON_PATH=%~dp0program\cddis_icon.png"
-)
-
-:: 6. Create Desktop Shortcut using PowerShell
-echo Creating Windows Desktop Shortcut...
+:: 5. Configure Windows Desktop Shortcut with .ico Icon
+set "ICON_PATH=%~dp0program\cddis_icon.ico"
 set "TARGET=%~dp0run_cddm.bat"
 for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "SHORTCUT=%%D\CDDM Live.lnk"
 

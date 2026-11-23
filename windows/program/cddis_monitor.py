@@ -30,6 +30,7 @@ Description : Desktop tool (Linux) built with PySide6 to verify that GNSS
 import base64
 import csv
 import html
+import json
 import math
 import os
 import re
@@ -396,7 +397,7 @@ class EarthdataSession(requests.Session):
         if cfg_proxy == "DIRECT":
             active_proxy = None
         else:
-            active_proxy = proxy_url or cfg_proxy or env_proxy or "http://192.168.101.19:3128/"
+            active_proxy = proxy_url or (cfg_proxy if cfg_proxy != "DIRECT" else None) or env_proxy or None
         if active_proxy:
             if not active_proxy.startswith("http"):
                 active_proxy = f"http://{active_proxy}"
@@ -425,7 +426,7 @@ def list_dir(session, url):
     """Fetches and parses a CDDIS HTML directory listing, extracting filenames, file sizes, and mod times."""
     import re
     try:
-        r = session.get(url, timeout=25)
+        r = session.get(url, timeout=(6, 12))
         if r.status_code == 404:
             return "NOT_FOUND", {}
         if r.status_code in (401, 403):
@@ -499,12 +500,13 @@ def list_dir(session, url):
 
 
 class LoginWorker(QtCore.QThread):
-    finished_auth = QtCore.Signal(bool, str, str, object)
+    finished_auth = QtCore.Signal(bool, str, str)
 
     def __init__(self, username, password, parent=None):
         super().__init__(parent)
         self.username = username
         self.password = password
+        self.result_session = None
 
     def __del__(self):
         try:
@@ -523,193 +525,38 @@ class LoginWorker(QtCore.QThread):
             if "urs.earthdata.nasa.gov" in r.url and "/oauth/authorize" in r.url:
                 self.finished_auth.emit(
                     False, "auth",
-                    "Authentication error: Authorize 'CDDIS' in your Earthdata profile.",
-                    None
+                    "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
                 )
                 return
 
             if r.status_code in (401, 403):
                 self.finished_auth.emit(
                     False, "auth",
-                    "Incorrect username or password.",
-                    None
+                    "Incorrect username or password."
                 )
                 return
 
             if r.status_code != 200:
                 self.finished_auth.emit(
                     False, "network",
-                    f"Server returned unexpected HTTP {r.status_code}.",
-                    None
+                    f"Server returned unexpected HTTP {r.status_code}."
                 )
                 return
 
-            self.finished_auth.emit(True, "ok", "Connected successfully.", sess)
+            self.result_session = sess
+            self.finished_auth.emit(True, "ok", "Connected successfully.")
         except requests.exceptions.Timeout:
             self.finished_auth.emit(
                 False, "network",
-                "Connection timed out. CDDIS server took too long to respond.",
-                None
+                "Connection timed out. CDDIS server took too long to respond."
             )
         except requests.exceptions.ConnectionError:
             self.finished_auth.emit(
                 False, "network",
-                "Network connection error. Waiting for internet...",
-                None
+                "Network connection error. Waiting for internet..."
             )
         except Exception as e:
-            import traceback; err_detail = traceback.format_exc(); self.finished_auth.emit(False, "network", f"Err: {str(e)} | {type(e).__name__}", None)
-
-class CheckWorker(QtCore.QThread):
-    results = QtCore.Signal(list)
-    slot_checked = QtCore.Signal(dict)
-    failed = QtCore.Signal(str)
-    log = QtCore.Signal(str)
-    progress = QtCore.Signal(int, int, str)
-
-    def __init__(self, session, dtype, slots_utc, stations, grace_min, cached_records=None, parent=None):
-        super().__init__(parent)
-        self.session = session
-        self.dtype = dtype
-        self.slots = slots_utc
-        self.stations = stations
-        self.grace = grace_min
-        self.cached_records = cached_records or {}
-
-    def run(self):
-        cfg = DATA_TYPES[self.dtype]
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        out = []
-        total_steps = len(self.slots) * len(self.stations)
-        current_step = 0
-
-        try:
-            # 1. Identify which slot URLs actually need remote network fetching
-            needed_urls = {}
-            for slot in self.slots:
-                doy = slot.timetuple().tm_yday
-                ddd_str = f"{doy:03d}"
-                hh_str = f"{slot.hour:02d}"
-                url = f"{BASE}/" + cfg["path"].format(
-                    Y=slot.year,
-                    DDD=ddd_str,
-                    yy=f"{slot.year % 100:02d}",
-                    HH=hh_str,
-                )
-                all_cached_ok = True
-                for st in self.stations:
-                    st_cache_key = (st.upper(), slot.year, doy, hh_str if cfg["hourly"] else "DAILY")
-                    cached = self.cached_records.get(st_cache_key)
-                    if not (cached and cached.get("status") == "OK"):
-                        all_cached_ok = False
-                        break
-                if not all_cached_ok and url not in needed_urls:
-                    needed_urls[url] = slot
-
-            # 2. Fetch uncached directories with live in-place percentage progress
-            fetched_maps = {}
-            if needed_urls:
-                total_fetch = len(needed_urls)
-                self.log.emit(f"PROGRESS:Scanning CDDIS: Directory audit 0% (0/{total_fetch})")
-                with ThreadPoolExecutor(max_workers=min(3, total_fetch)) as pool:
-                    future_to_url = {pool.submit(list_dir, self.session, u): u for u in needed_urls}
-                    completed_fetch = 0
-                    for fut in as_completed(future_to_url):
-                        u = future_to_url[fut]
-                        completed_fetch += 1
-                        try:
-                            _state, fmap = fut.result()
-                            fetched_maps[u] = fmap
-                        except Exception:
-                            fetched_maps[u] = {}
-                        
-                        pct = int((completed_fetch / total_fetch) * 100)
-                        self.progress.emit(completed_fetch, total_fetch, f"Scanning CDDIS: {pct}% ({completed_fetch}/{total_fetch})")
-                        self.log.emit(f"PROGRESS:Scanning CDDIS: Directory audit {pct}% ({completed_fetch}/{total_fetch})")
-
-            # 3. Process and log each slot in strict chronological order (00..23 UTC)
-            for slot in self.slots:
-                doy = slot.timetuple().tm_yday
-                ddd_str = f"{doy:03d}"
-                hh_str = f"{slot.hour:02d}"
-                url = f"{BASE}/" + cfg["path"].format(
-                    Y=slot.year,
-                    DDD=ddd_str,
-                    yy=f"{slot.year % 100:02d}",
-                    HH=hh_str,
-                )
-                length = dt.timedelta(hours=1) if cfg["hourly"] else dt.timedelta(days=1)
-                due_utc = slot + length + dt.timedelta(minutes=self.grace)
-
-                slot_label = f"{slot.year} DOY {ddd_str} Hr {hh_str}" if cfg["hourly"] else f"{slot.year} DOY {ddd_str}"
-                self.log.emit(f"Scanning CDDIS: {url}")
-                file_map = fetched_maps.get(url, {})
-
-                for st in self.stations:
-                    current_step += 1
-                    self.progress.emit(current_step, total_steps, f"Checking {st} [{slot_label}]")
-
-                    st_cache_key = (st.upper(), slot.year, doy, hh_str if cfg["hourly"] else "DAILY")
-                    cached = self.cached_records.get(st_cache_key)
-
-                    st_lower = st.lower()
-                    matched = sorted(
-                        [
-                            (fname, meta) for fname, meta in file_map.items()
-                            if fname.lower().startswith(st_lower)
-                            and not fname.lower().endswith((".md5", ".sha512", ".sha256"))
-                        ],
-                        key=lambda x: x[0]
-                    )
-
-                    count = len(matched)
-                    if count >= cfg["expected"]:
-                        status = "OK"
-                    elif count > 0:
-                        status = "PARTIAL"
-                    elif cached and cached.get("status") == "OK":
-                        # Retain previously verified OK status if current poll returned empty
-                        status = "OK"
-                        count = cached.get("files", cfg["expected"])
-                    else:
-                        status = "MISSING"
-
-                    if status != "OK" and now_utc < due_utc:
-                        status = "PENDING"
-
-                    if matched:
-                        total_size = sum(m.get("size", 0) for _, m in matched if isinstance(m.get("size"), (int, float)))
-                        mods = [m.get("mod") for _, m in matched if m.get("mod")]
-                        latest_mod = max(mods) if mods else "-"
-                        fnames_list = [fname for fname, _ in matched]
-                    elif cached:
-                        total_size = cached.get("size", 0)
-                        latest_mod = cached.get("mod", "-")
-                        fnames_list = [cached.get("filenames", "")] if isinstance(cached.get("filenames"), str) else cached.get("filenames", [])
-                    else:
-                        total_size = 0
-                        latest_mod = "-"
-                        fnames_list = []
-
-                    out.append(dict(
-                        station=st.upper(),
-                        slot=slot,
-                        year=slot.year,
-                        doy=doy,
-                        hour_str=hh_str if cfg["hourly"] else "DAILY",
-                        status=status,
-                        files=count,
-                        expected=cfg["expected"],
-                        filenames=", ".join(fnames_list) if fnames_list else "–",
-                        size=total_size,
-                        mod=latest_mod,
-                        checked=now_utc,
-                        url=url
-                    ))
-            self.results.emit(out)
-        except Exception as e:
-            self.failed.emit(str(e))
-
+            self.finished_auth.emit(False, "network", f"Err: {str(e)} | {type(e).__name__}")
 
 class LoginDialog(QtWidgets.QDialog):
     MAX_BOOT_RETRIES = 12
@@ -897,8 +744,9 @@ class LoginDialog(QtWidgets.QDialog):
         self.worker.finished_auth.connect(self.on_login_finished)
         self.worker.start()
 
-    def on_login_finished(self, success, err_type, message, session):
+    def on_login_finished(self, success, err_type, message):
         if success:
+            session = getattr(self.worker, "result_session", None)
             self.retry_timer.stop()
             s = QtCore.QSettings("gnss-tools", "cddis-monitor")
             s.setValue("username", self.user.text().strip())
@@ -1137,13 +985,13 @@ class ArchiveGapAnalyzerDialog(QtWidgets.QDialog):
         ctrl_box.addWidget(QtWidgets.QLabel("From DOY:"))
         self.start_doy = QtWidgets.QSpinBox()
         self.start_doy.setRange(1, 366)
-        self.start_doy.setValue(max(1, dt.datetime.now().timetuple().tm_yday - 30))
+        self.start_doy.setValue(max(1, dt.dt.dt.datetime.now().timetuple().tm_yday - 30))
         ctrl_box.addWidget(self.start_doy)
 
         ctrl_box.addWidget(QtWidgets.QLabel("To DOY:"))
         self.end_doy = QtWidgets.QSpinBox()
         self.end_doy.setRange(1, 366)
-        self.end_doy.setValue(dt.datetime.now().timetuple().tm_yday)
+        self.end_doy.setValue(dt.dt.dt.datetime.now().timetuple().tm_yday)
         ctrl_box.addWidget(self.end_doy)
 
         self.scan_btn = QtWidgets.QPushButton("Run Offline Audit")
@@ -1308,6 +1156,2111 @@ class ArchiveGapAnalyzerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Export Successful", f"Saved {exported_count} displayed record(s) to:\n{path}")
         except Exception as ex:
             QtWidgets.QMessageBox.critical(self, "Export Failed", str(ex))
+
+
+
+class CheckWorker(QtCore.QThread):
+    results = QtCore.Signal(list)
+    slot_checked = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+    log = QtCore.Signal(str)
+    progress = QtCore.Signal(int, int, str)
+
+    def __init__(self, session, dtype, slots_utc, stations, grace_min, cached_records=None, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.dtype = dtype
+        self.slots_utc = slots_utc
+        self.stations = [s.upper() for s in stations]
+        self.grace_min = grace_min
+        self.cached_records = cached_records or {}
+
+    def run(self):
+        try:
+            cfg = DATA_TYPES[self.dtype]
+            sess = self.session or EarthdataSession()
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            out_rows = []
+            total = len(self.slots_utc) * len(self.stations)
+            done = 0
+
+            def _fetch_slot(slot_dt):
+                y = slot_dt.year
+                doy = slot_dt.timetuple().tm_yday
+                hh_str = f"{slot_dt.hour:02d}" if cfg["hourly"] else "00"
+                url = f"{BASE}/" + cfg["path"].format(Y=y, DDD=f"{doy:03d}", yy=f"{y % 100:02d}", HH=hh_str)
+                # Only hit network if at least one station isn't already cached OK
+                needs_net = any((st, y, doy, hh_str) not in self.cached_records for st in self.stations)
+                if not needs_net:
+                    return slot_dt, url, "ok", {}
+                st_code, fmap = list_dir(sess, url)
+                return slot_dt, url, st_code, fmap
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(_fetch_slot, sl): sl for sl in self.slots_utc}
+                for fut in as_completed(futures):
+                    if self.isInterruptionRequested():
+                        break
+                    slot_dt, url, st_code, fmap = fut.result()
+                    y = slot_dt.year
+                    doy = slot_dt.timetuple().tm_yday
+                    hh_str = f"{slot_dt.hour:02d}" if cfg["hourly"] else "00"
+                    slot_end = slot_dt + (dt.timedelta(hours=1) if cfg["hourly"] else dt.timedelta(days=1))
+                    grace_deadline = slot_end + dt.timedelta(minutes=self.grace_min)
+
+                    for st in self.stations:
+                        cached = self.cached_records.get((st, y, doy, hh_str))
+                        if cached and cached.get("status") == "OK":
+                            row = dict(cached)
+                            out_rows.append(row)
+                            done += 1
+                            self.slot_checked.emit(row)
+                            self.progress.emit(done, total, f"Cached {st} Hr {hh_str}")
+                            continue
+
+                        matches = sorted([fn for fn in fmap if fn.lower().startswith(st.lower())])
+                        f_cnt = len(matches)
+                        exp_cnt = cfg["expected"]
+                        if f_cnt >= exp_cnt:
+                            status = "OK"
+                        elif f_cnt > 0:
+                            status = "PARTIAL"
+                        elif now_utc < grace_deadline:
+                            status = "PENDING"
+                        else:
+                            status = "MISSING"
+
+                        tot_sz = sum(fmap[fn].get("size", 0.0) for fn in matches) * 1024.0
+                        mod_str = fmap[matches[-1]].get("mod", "-") if matches else "-"
+                        row = {
+                            "station": st,
+                            "slot": slot_dt,
+                            "year": y,
+                            "doy": doy,
+                            "hour_str": hh_str,
+                            "status": status,
+                            "files": f_cnt,
+                            "expected": exp_cnt,
+                            "filenames": ", ".join(matches) if matches else "-",
+                            "size": tot_sz,
+                            "mod": mod_str,
+                            "checked": dt.datetime.now(dt.timezone.utc),
+                            "url": url,
+                        }
+                        out_rows.append(row)
+                        done += 1
+                        self.slot_checked.emit(row)
+                        self.progress.emit(done, total, f"Checked {st} Hr {hh_str}: {status}")
+
+            out_rows.sort(key=lambda r: (r["slot"], r["station"]))
+            self.results.emit(out_rows)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class CustomScanWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    progress = QtCore.Signal(int, int, str)
+    row_scanning = QtCore.Signal(int, int, str, str)
+    row_ready = QtCore.Signal(dict)
+    finished_all = QtCore.Signal(str, list)
+
+    def __init__(self, session, dtype, stations, date_list, out_dir, auto_audit=True, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.dtype = dtype
+        self.stations = [s.upper() for s in stations]
+        self.date_list = date_list
+        self.out_dir = out_dir
+        self.auto_audit = auto_audit
+
+    def _custom_doy_filepath(self, year, doy, st):
+        years_in_scan = {y for (y, _) in self.date_list}
+        if len(years_in_scan) > 1:
+            return os.path.join(self.out_dir, str(year), st.upper(), f"{doy:03d}.txt")
+        return get_station_doy_filepath(self.out_dir, st, year, doy)
+
+    def _build_rows_from_dir_maps(self, cfg, year, doy, st, dir_maps):
+        base_day = dt.datetime(year, 1, 1, 0, 0, 0, tzinfo=dt.timezone.utc) + dt.timedelta(days=doy - 1)
+        hours = range(24) if cfg["hourly"] else [0]
+        rows = []
+        for h in hours:
+            hh_str = f"{h:02d}"
+            fmap = dir_maps.get(hh_str, {})
+            matches = sorted([fn for fn in fmap if fn.lower().startswith(st.lower())])
+            f_cnt = len(matches)
+            exp_cnt = cfg["expected"]
+            status = "OK" if f_cnt >= exp_cnt else ("PARTIAL" if f_cnt > 0 else "MISSING")
+            tot_sz = sum(fmap[fn].get("size", 0.0) for fn in matches) * 1024.0
+            mod_str = fmap[matches[-1]].get("mod", "-") if matches else "-"
+            rows.append({
+                "station": st,
+                "slot": base_day + dt.timedelta(hours=h),
+                "year": year,
+                "doy": doy,
+                "hour_str": hh_str,
+                "status": status,
+                "files": f_cnt,
+                "expected": exp_cnt,
+                "filenames": ", ".join(matches) if matches else "-",
+                "size": tot_sz,
+                "mod": mod_str,
+            })
+        return rows
+
+    def _write_station_doy_report(self, year, doy, st, st_rows):
+        filepath = self._custom_doy_filepath(year, doy, st)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        total = len(st_rows)
+        counts = {}
+        for r in st_rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=" * 110 + "\n")
+            f.write("NASA CDDIS GNSS ARCHIVE - CUSTOM SCAN DOY SUMMARY REPORT\n")
+            f.write(f"Station       : {st}\n")
+            f.write(f"Year / DOY    : {year} / DOY {doy:03d}\n")
+            f.write(f"Data Type     : {self.dtype}\n")
+            f.write(f"Generated on  : {dt.dt.dt.datetime.now():%Y-%m-%d %H:%M:%S} Local Time\n")
+            f.write("=" * 96 + "\n\n")
+            f.write("STATUS SUMMARY:\n")
+            for st_type in ("OK", "PARTIAL", "MISSING"):
+                c = counts.get(st_type, 0)
+                pct = (c / total * 100) if total else 0
+                f.write(f"  - {st_type:<10}: {c:>3} ({pct:.1f}%)\n")
+            f.write("\n" + "-" * 96 + "\n")
+            f.write(f"{'Station':<8} {'Hour (UTC)':<11} {'Status':<9} {'Files':<6} {'Size (KB)':<11} {'Last Modified (UTC)':<20} {'Uploaded File(s)'}\n")
+            f.write("-" * 110 + "\n")
+            for r in sorted(st_rows, key=lambda x: x["slot"]):
+                f.write(
+                    f"{r['station']:<8} Hr {r['hour_str']:<7} {r['status']:<9} "
+                    f"{r['files']}/{r['expected']:<4} {r.get('size', 0)/1024:<11.1f} "
+                    f"{str(r.get('mod', '-')):<20} {r.get('filenames', '')}\n"
+                )
+            f.write("=" * 110 + "\n")
+
+    def _write_total_summary(self, summary_path, day_records, audit_notes=None, start_dt=None, end_dt=None):
+        os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+        merged_list = sorted(day_records, key=lambda r: (r["year"], r["doy"], r["station"]))
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("=" * 115 + "\n")
+            f.write("NASA CDDIS GNSS ARCHIVE - CONSOLIDATED CUSTOM SCAN SUMMARY\n")
+            f.write(f"Data Type     : {self.dtype}\n")
+            f.write(f"Stations      : {', '.join(self.stations)}\n")
+            if merged_list:
+                f.write(f"Range         : {merged_list[0]['year']}-DOY{merged_list[0]['doy']:03d} to {merged_list[-1]['year']}-DOY{merged_list[-1]['doy']:03d}\n")
+            if start_dt and end_dt:
+                elapsed_s = max(0.0, (end_dt - start_dt).total_seconds())
+                hrs, rem = divmod(int(elapsed_s), 3600)
+                mins, secs = divmod(rem, 60)
+                dur_str = f"{hrs:02d}h {mins:02d}m {secs:02d}s ({elapsed_s:.1f}s)" if hrs else f"{mins:02d}m {secs:02d}s ({elapsed_s:.1f}s)"
+                f.write(f"Scan Duration : Start: {start_dt:%Y-%m-%d %H:%M:%S} | End: {end_dt:%Y-%m-%d %H:%M:%S} | Total Duration: {dur_str}\n")
+            f.write(f"Updated on    : {dt.dt.dt.datetime.now():%Y-%m-%d %H:%M:%S} Local Time\n")
+            f.write("=" * 115 + "\n\n")
+            f.write(f"{'Year':<6} {'DOY':<5} {'Date (UTC)':<12} {'Station':<9} {'Status':<10} {'OK/Tot':<8} {'Missing Slots'}\n")
+            f.write("-" * 115 + "\n")
+            for rec in merged_list:
+                f.write(
+                    f"{rec['year']:<6} {rec['doy']:03d}   {rec['date_str']:<12} {rec['station']:<9} "
+                    f"{rec['status']:<10} {rec['ok_cnt']}/{rec['total_cnt']:<6} {rec['missing_str']}\n"
+                )
+            f.write("=" * 115 + "\n")
+            if audit_notes:
+                f.write("\nPOST-SCAN GAP AUDIT & RETRY RECOVERY LOG:\n")
+                for note in audit_notes:
+                    f.write(f"  - {note}\n")
+
+    def _fetch_all_days_pipelined(self, sess, cfg, day_to_stns, phase_label="Scanning", on_day_complete=None):
+        import threading
+        all_maps = {}
+        hours = list(range(24)) if cfg["hourly"] else [0]
+        ordered_days = sorted(day_to_stns.keys())
+        if not ordered_days:
+            return all_maps
+
+        # Thread-local keep-alive sessions sharing cookies/auth/proxies safely
+        tls = threading.local()
+        def _get_thread_sess():
+            if not hasattr(tls, "s"):
+                creds = getattr(sess, "auth_creds", None) or (None, None)
+                s = EarthdataSession(username=creds[0], password=creds[1])
+                if hasattr(sess, "cookies"):
+                    for ck in sess.cookies:
+                        s.cookies.set_cookie(ck)
+                if getattr(sess, "proxies", None):
+                    s.proxies.update(sess.proxies)
+                if getattr(sess, "auth", None):
+                    s.auth = sess.auth
+                    s.auth_creds = creds
+                tls.s = s
+            return tls.s
+
+        day_buffers = {yd: {} for yd in ordered_days}
+        day_counts = {yd: 0 for yd in ordered_days}
+        started_days = set()
+        buf_lock = threading.Lock()
+
+        tasks = [(y, d, h) for (y, d) in ordered_days for h in hours]
+
+        def _worker(task):
+            if self.isInterruptionRequested():
+                return task, {}
+            y, d, h = task
+            with buf_lock:
+                if (y, d) not in started_days:
+                    started_days.add((y, d))
+                    for st in day_to_stns[(y, d)]:
+                        self.row_scanning.emit(y, d, st, f"{phase_label}…")
+            hh_str = f"{h:02d}"
+            url = f"{BASE}/" + cfg["path"].format(Y=y, DDD=f"{d:03d}", yy=f"{y % 100:02d}", HH=hh_str)
+            _, fmap = list_dir(_get_thread_sess(), url)
+            return (y, d, hh_str), fmap
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(_worker, t) for t in tasks]
+            for fut in as_completed(futures):
+                if self.isInterruptionRequested():
+                    for pending_f in futures:
+                        pending_f.cancel()
+                    break
+                res_key, fmap = fut.result()
+                if len(res_key) != 3:
+                    continue
+                y, d, hh_str = res_key
+                completed_d_maps = None
+                with buf_lock:
+                    day_buffers[(y, d)][hh_str] = fmap
+                    day_counts[(y, d)] += 1
+                    if day_counts[(y, d)] == len(hours):
+                        completed_d_maps = day_buffers.pop((y, d))
+                        all_maps[(y, d)] = completed_d_maps
+
+                if completed_d_maps is not None and on_day_complete:
+                    on_day_complete(y, d, day_to_stns[(y, d)], completed_d_maps)
+
+        if hasattr(sess, "save_cookies_now"):
+            sess.save_cookies_now()
+        return all_maps
+
+    def run(self):
+        import threading
+        scan_start_dt = dt.dt.dt.datetime.now()
+        cfg = DATA_TYPES[self.dtype]
+        sess = self.session or EarthdataSession()
+        total_tasks = len(self.date_list) * len(self.stations)
+        completed_tasks = 0
+        day_records = []
+        rows_by_key = {}
+        day_to_uncached = {}
+        records_lock = threading.Lock()
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        summary_path = os.path.join(self.out_dir, "CUSTOM_SCAN_TOTAL_SUMMARY.txt")
+        years_in_scan = sorted({y for (y, _) in self.date_list})
+
+        def _flush_summaries(audit_notes=None):
+            with records_lock:
+                snap = list(day_records)
+            if not snap:
+                return
+            now_dt = dt.dt.dt.datetime.now()
+            self._write_total_summary(
+                summary_path, snap, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt
+            )
+            if len(years_in_scan) > 1:
+                for yr in years_in_scan:
+                    yr_recs = [r for r in snap if r["year"] == yr]
+                    if yr_recs:
+                        yr_sum_path = os.path.join(self.out_dir, str(yr), f"CUSTOM_SCAN_{yr}_SUMMARY.txt")
+                        self._write_total_summary(
+                            yr_sum_path, yr_recs, audit_notes=audit_notes, start_dt=scan_start_dt, end_dt=now_dt
+                        )
+
+        try:
+            for (y, d) in self.date_list:
+                d_str = (dt.date(y, 1, 1) + dt.timedelta(days=d - 1)).strftime("%Y-%m-%d")
+                expected_slots = 24 if cfg["hourly"] else 1
+                for st in self.stations:
+                    existing_fp = self._custom_doy_filepath(y, d, st)
+                    cached_state, _ = parse_single_summary_file(existing_fp)
+                    if cached_state == "ok":
+                        completed_tasks += 1
+                        self.progress.emit(completed_tasks, total_tasks, f"Cached OK · {st} {y} DOY {d:03d} ({completed_tasks}/{total_tasks})")
+                        summary_item = dict(
+                            year=y, doy=d, date_str=d_str, station=st,
+                            status="COMPLETE", ok_cnt=expected_slots, total_cnt=expected_slots, missing_str="None"
+                        )
+                        with records_lock:
+                            day_records.append(summary_item)
+                        self.row_ready.emit(summary_item)
+                    else:
+                        day_to_uncached.setdefault((y, d), []).append(st)
+
+            _flush_summaries()
+
+            if day_to_uncached and not self.isInterruptionRequested():
+                def _commit_completed_day(y, d, st_list, dir_maps):
+                    nonlocal completed_tasks
+                    if self.isInterruptionRequested():
+                        return
+                    d_str = (dt.date(y, 1, 1) + dt.timedelta(days=d - 1)).strftime("%Y-%m-%d")
+                    for st in st_list:
+                        st_rows = self._build_rows_from_dir_maps(cfg, y, d, st, dir_maps)
+                        self._write_station_doy_report(y, d, st, st_rows)
+                        ok_cnt = sum(1 for r in st_rows if r["status"] == "OK")
+                        tot_cnt = len(st_rows)
+                        miss_hrs = [r["hour_str"] for r in st_rows if r["status"] != "OK"]
+                        day_status = "COMPLETE" if ok_cnt == tot_cnt else ("PARTIAL" if ok_cnt > 0 else "MISSING")
+                        summary_item = dict(
+                            year=y, doy=d, date_str=d_str, station=st,
+                            status=day_status, ok_cnt=ok_cnt, total_cnt=tot_cnt,
+                            missing_str=", ".join(miss_hrs) if miss_hrs else "None"
+                        )
+                        with records_lock:
+                            rows_by_key[(y, d, st)] = st_rows
+                            day_records.append(summary_item)
+                            completed_tasks += 1
+                            cur_done = completed_tasks
+                        self.progress.emit(cur_done, total_tasks, f"Completed {st} · {y} DOY {d:03d} ({cur_done}/{total_tasks})")
+                        self.row_ready.emit(summary_item)
+                    _flush_summaries()
+
+                self._fetch_all_days_pipelined(
+                    sess, cfg, day_to_uncached, phase_label="Scanning", on_day_complete=_commit_completed_day
+                )
+
+            _flush_summaries()
+
+            audit_notes = []
+            if self.auto_audit and not self.isInterruptionRequested() and day_records:
+                audit_day_to_stns = {}
+                with records_lock:
+                    for rec in day_records:
+                        if rec["status"] in ("PARTIAL", "MISSING") or rec["ok_cnt"] < rec["total_cnt"]:
+                            audit_day_to_stns.setdefault((rec["year"], rec["doy"]), []).append(rec["station"])
+
+                if not audit_day_to_stns:
+                    audit_notes.append("Audit verified 0 gaps across all scanned station-days.")
+                else:
+                    self.progress.emit(0, len(audit_day_to_stns), f"Audit Retry running across {len(audit_day_to_stns)} day(s)…")
+                    retry_maps = self._fetch_all_days_pipelined(sess, cfg, audit_day_to_stns, phase_label="Audit Retry")
+                    for (gy, gd), gst_list in sorted(audit_day_to_stns.items()):
+                        d_maps = retry_maps.get((gy, gd), {})
+                        for gst in gst_list:
+                            with records_lock:
+                                old_rows = rows_by_key.get((gy, gd, gst), [])
+                            old_ok = sum(1 for r in old_rows if r["status"] == "OK")
+                            refreshed_rows = self._build_rows_from_dir_maps(cfg, gy, gd, gst, d_maps)
+                            new_ok = sum(1 for r in refreshed_rows if r["status"] == "OK")
+                            if new_ok > old_ok:
+                                self._write_station_doy_report(gy, gd, gst, refreshed_rows)
+                                miss_hrs = [r["hour_str"] for r in refreshed_rows if r["status"] != "OK"]
+                                new_status = "COMPLETE" if new_ok == len(refreshed_rows) else "PARTIAL"
+                                with records_lock:
+                                    rows_by_key[(gy, gd, gst)] = refreshed_rows
+                                    for rec in day_records:
+                                        if rec["year"] == gy and rec["doy"] == gd and rec["station"] == gst:
+                                            rec["ok_cnt"] = new_ok
+                                            rec["status"] = new_status
+                                            rec["missing_str"] = ", ".join(miss_hrs) if miss_hrs else "None"
+                                            self.row_ready.emit(dict(rec))
+                                note = f"[RECOVERED] {gst} {gy}-DOY{gd:03d}: {old_ok}/{len(refreshed_rows)} -> {new_ok}/{len(refreshed_rows)}"
+                            else:
+                                note = f"[UNCHANGED] {gst} {gy}-DOY{gd:03d}: {new_ok}/{len(refreshed_rows)} available on CDDIS."
+                            audit_notes.append(note)
+                            self.log.emit(note)
+                _flush_summaries(audit_notes=audit_notes)
+        except Exception as exc:
+            import traceback
+            err_txt = f"Custom Scan error: {exc}"
+            self.log.emit(f"[THROTTLE GUARD] {err_txt}")
+            print(traceback.format_exc())
+            _flush_summaries(audit_notes=[err_txt])
+
+        self.progress.emit(total_tasks, total_tasks, "Completed")
+        self.finished_all.emit(summary_path, day_records)
+
+
+class ArchiveGapAnalyzerDialog(QtWidgets.QDialog):
+    def __init__(self, parent, root_dir, stations, year):
+        super().__init__(parent)
+        self.setWindowTitle("Offline Archive Gap Audit")
+        self.resize(780, 520)
+        lay = QtWidgets.QVBoxLayout(self)
+        tbl = QtWidgets.QTableWidget(0, 4)
+        tbl.setHorizontalHeaderLabels(["Station", "DOY", "Status", "Details"])
+        tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        now_doy = dt.datetime.now(dt.timezone.utc).timetuple().tm_yday
+        for st in stations:
+            for d in range(max(1, now_doy - 30), now_doy):
+                fp = get_station_doy_filepath(root_dir, st, year, d)
+                state, det = parse_single_summary_file(fp)
+                r = tbl.rowCount()
+                tbl.insertRow(r)
+                for c, val in enumerate([st, f"{d:03d}", state.upper(), det]):
+                    tbl.setItem(r, c, QtWidgets.QTableWidgetItem(val))
+        lay.addWidget(tbl)
+        btn = QtWidgets.QPushButton("Close")
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn)
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("CDDM Preferences")
+        self.resize(400, 180)
+        s = QtCore.QSettings("gnss-tools", "cddis-monitor")
+        lay = QtWidgets.QVBoxLayout(self)
+        chk_auto = QtWidgets.QCheckBox("Launch automatically on Linux desktop login")
+        chk_auto.setChecked(s.value("autostart", True, type=bool))
+        lay.addWidget(chk_auto)
+        btn_save = QtWidgets.QPushButton("Save & Close")
+        def _save():
+            s.setValue("autostart", chk_auto.isChecked())
+            s.sync()
+            install_linux_autostart(chk_auto.isChecked())
+            self.accept()
+        btn_save.clicked.connect(_save)
+        lay.addWidget(btn_save)
+
+
+class StationProbeWorker(QtCore.QThread):
+    finished_probe = QtCore.Signal(str)
+
+    def __init__(self, session, stations, dtype, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.stations = stations
+        self.dtype = dtype
+
+    def run(self):
+        ref_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+        probe_y = ref_dt.year
+        probe_d = ref_dt.timetuple().tm_yday
+        ddd_str = f"{probe_d:03d}"
+        yy_str = f"{probe_y % 100:02d}"
+
+        cfg = DATA_TYPES[self.dtype]
+        probe_url = f"{BASE}/" + cfg["path"].format(Y=probe_y, DDD=ddd_str, yy=yy_str, HH="00")
+
+        sess = self.session or EarthdataSession()
+        state, fmap = list_dir(sess, probe_url)
+
+        daily_fmap = {}
+        if cfg["hourly"]:
+            daily_url = f"{BASE}/daily/{probe_y}/{ddd_str}/{yy_str}d"
+            _, daily_fmap = list_dir(sess, daily_url)
+
+        if state != "ok" and not fmap and not daily_fmap:
+            self.finished_probe.emit(
+                f"<span style='color:#d92d20; font-weight:600;'>Archive unreachable ({state}) on baseline {probe_y}-DOY{ddd_str}</span>"
+            )
+            return
+
+        findings = []
+        for st in self.stations:
+            matches = [fn for fn in fmap if fn.lower().startswith(st.lower())]
+            if matches:
+                findings.append(f"<span style='color:#15803d; font-weight:600;'>● {st}: Available ({matches[0]})</span>")
+            elif cfg["hourly"] and any(fn.lower().startswith(st.lower()) for fn in daily_fmap):
+                findings.append(f"<span style='color:#c2410c; font-weight:600;'>▲ {st}: Daily-only station (no Hourly stream)</span>")
+            else:
+                findings.append(f"<span style='color:#d92d20; font-weight:600;'>✕ {st}: Not found on CDDIS ({self.dtype})</span>")
+        self.finished_probe.emit("   ·   ".join(findings))
+
+
+class CustomScanDialog(QtWidgets.QDialog):
+    def __init__(self, parent, session, default_stations="", default_dtype="Hourly observation", default_out_dir=""):
+        super().__init__(parent)
+        self.session = session
+        self.worker = None
+        self._active_row_idx = None
+        self._pulse_phase = 0
+        self.setWindowTitle("Custom Archive Scan & Post-Audit")
+        self.resize(960, 680)
+
+        # Apple HIG Clean Light Theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f5f7;
+                color: #1d1d1f;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            }
+            QGroupBox {
+                background-color: #ffffff;
+                border: 1px solid #d2d2d7;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding: 14px 12px 10px 12px;
+                font-weight: 600;
+                font-size: 12px;
+                color: #1d1d1f;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                background-color: #f5f5f7;
+                border-radius: 4px;
+                color: #424245;
+            }
+            QLabel {
+                color: #1d1d1f;
+                font-size: 12px;
+            }
+            QRadioButton, QCheckBox {
+                color: #1d1d1f;
+                font-size: 12px;
+                spacing: 6px;
+            }
+            QLineEdit, QComboBox, QSpinBox {
+                background-color: #ffffff;
+                color: #1d1d1f;
+                border: 1px solid #d2d2d7;
+                border-radius: 6px;
+                padding: 5px 9px;
+                font-size: 12px;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+                border: 1.5px solid #0071e3;
+            }
+            QLineEdit:disabled, QSpinBox:disabled {
+                background-color: #f5f5f7;
+                color: #86868b;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                color: #1d1d1f;
+                gridline-color: #ececef;
+                border: 1px solid #d2d2d7;
+                border-radius: 8px;
+                font-size: 12px;
+                selection-background-color: #e8f2ff;
+                selection-color: #1d1d1f;
+            }
+            QHeaderView::section {
+                background-color: #fbfbfd;
+                color: #424245;
+                padding: 6px 8px;
+                border: none;
+                border-bottom: 1px solid #d2d2d7;
+                border-right: 1px solid #ececef;
+                font-weight: 600;
+                font-size: 11px;
+            }
+            QPlainTextEdit {
+                background-color: #ffffff;
+                color: #333336;
+                border: 1px solid #d2d2d7;
+                border-radius: 8px;
+                padding: 6px;
+                font-family: monospace;
+                font-size: 11px;
+            }
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        # Card 1: Station & File Type Selection
+        st_group = QtWidgets.QGroupBox("1. Station && File Type Selection")
+        st_lay = QtWidgets.QVBoxLayout(st_group)
+        st_lay.setSpacing(8)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(8)
+        row1.addWidget(QtWidgets.QLabel("Station ID(s):"))
+        self.st_input = QtWidgets.QLineEdit(default_stations)
+        self.st_input.setPlaceholderText("e.g. IISC, HYDE, LCK4")
+        row1.addWidget(self.st_input, 1)
+
+        row1.addWidget(QtWidgets.QLabel("Data Type:"))
+        self.dtype_combo = QtWidgets.QComboBox()
+        self.dtype_combo.addItems(DATA_TYPES.keys())
+        idx = self.dtype_combo.findText(default_dtype)
+        if idx >= 0:
+            self.dtype_combo.setCurrentIndex(idx)
+        row1.addWidget(self.dtype_combo)
+
+        self.btn_verify_st = QtWidgets.QPushButton("Check Station Availability")
+        self.btn_verify_st.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_verify_st.setStyleSheet("""
+            QPushButton {
+                background-color: #e8f2ff;
+                color: #0071e3;
+                border: 1px solid #b6d8ff;
+                border-radius: 6px;
+                padding: 5px 14px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #d8eaff; }
+            QPushButton:disabled { background-color: #f5f5f7; color: #86868b; border-color: #d2d2d7; }
+        """)
+        self.btn_verify_st.clicked.connect(self.check_station_availability)
+        row1.addWidget(self.btn_verify_st)
+        st_lay.addLayout(row1)
+
+        self.avail_lbl = QtWidgets.QLabel("Probe a recent baseline DOY to confirm whether each station publishes hourly or daily-only files on CDDIS.")
+        self.avail_lbl.setStyleSheet("color: #6e6e73; font-size: 11px;")
+        self.avail_lbl.setWordWrap(True)
+        st_lay.addWidget(self.avail_lbl)
+        layout.addWidget(st_group)
+
+        # Card 2: Custom DOY / Multi-Year Date Range
+        rng_group = QtWidgets.QGroupBox("2. Custom DOY / Multi-Year Date Range")
+        rng_lay = QtWidgets.QVBoxLayout(rng_group)
+        rng_lay.setSpacing(8)
+
+        mode_row = QtWidgets.QHBoxLayout()
+        self.rb_single = QtWidgets.QRadioButton("Particular DOY(s) (comma-separated in a Year)")
+        self.rb_range = QtWidgets.QRadioButton("From Year / DOY  →  To Year / DOY")
+        self.rb_range.setChecked(True)
+        mode_row.addWidget(self.rb_single)
+        mode_row.addWidget(self.rb_range)
+        mode_row.addStretch()
+        rng_lay.addLayout(mode_row)
+
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        cur_y = now_utc.year
+        cur_doy = max(1, now_utc.timetuple().tm_yday - 1)
+
+        single_row = QtWidgets.QHBoxLayout()
+        single_row.setSpacing(8)
+        single_row.addWidget(QtWidgets.QLabel("Year:"))
+        self.single_year = QtWidgets.QSpinBox()
+        self.single_year.setRange(1990, 2099)
+        self.single_year.setValue(cur_y)
+        single_row.addWidget(self.single_year)
+
+        single_row.addWidget(QtWidgets.QLabel("DOY(s):"))
+        self.single_doys = QtWidgets.QLineEdit(f"{cur_doy:03d}")
+        self.single_doys.setPlaceholderText("e.g. 120, 125, 130-135")
+        single_row.addWidget(self.single_doys, 1)
+        rng_lay.addLayout(single_row)
+
+        range_row = QtWidgets.QHBoxLayout()
+        range_row.setSpacing(8)
+        range_row.addWidget(QtWidgets.QLabel("From Year:"))
+        self.from_year = QtWidgets.QSpinBox()
+        self.from_year.setRange(1990, 2099)
+        self.from_year.setValue(cur_y)
+        range_row.addWidget(self.from_year)
+
+        range_row.addWidget(QtWidgets.QLabel("From DOY:"))
+        self.from_doy = QtWidgets.QSpinBox()
+        self.from_doy.setRange(1, 366)
+        self.from_doy.setValue(max(1, cur_doy - 2))
+        range_row.addWidget(self.from_doy)
+
+        range_row.addWidget(QtWidgets.QLabel("   To Year:"))
+        self.to_year = QtWidgets.QSpinBox()
+        self.to_year.setRange(1990, 2099)
+        self.to_year.setValue(cur_y)
+        range_row.addWidget(self.to_year)
+
+        range_row.addWidget(QtWidgets.QLabel("To DOY:"))
+        self.to_doy = QtWidgets.QSpinBox()
+        self.to_doy.setRange(1, 366)
+        self.to_doy.setValue(cur_doy)
+        range_row.addWidget(self.to_doy)
+        range_row.addStretch()
+        rng_lay.addLayout(range_row)
+
+        def _toggle_inputs():
+            is_s = self.rb_single.isChecked()
+            self.single_year.setEnabled(is_s)
+            self.single_doys.setEnabled(is_s)
+            self.from_year.setEnabled(not is_s)
+            self.from_doy.setEnabled(not is_s)
+            self.to_year.setEnabled(not is_s)
+            self.to_doy.setEnabled(not is_s)
+
+        self.rb_single.toggled.connect(_toggle_inputs)
+        self.rb_range.toggled.connect(_toggle_inputs)
+        _toggle_inputs()
+        layout.addWidget(rng_group)
+
+        # Card 3: Output Folder & Post-Scan Audit
+        out_group = QtWidgets.QGroupBox("3. Output Folder && Post-Scan Gap Audit")
+        out_lay = QtWidgets.QHBoxLayout(out_group)
+        out_lay.setSpacing(8)
+
+        out_lay.addWidget(QtWidgets.QLabel("Output Folder:"))
+        self.out_input = QtWidgets.QLineEdit(default_out_dir or os.path.expanduser("~/Downloads/CDDM_Custom"))
+        out_lay.addWidget(self.out_input, 1)
+
+        btn_browse = QtWidgets.QPushButton("Browse…")
+        btn_browse.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_browse.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f7;
+                color: #1d1d1f;
+                border: 1px solid #d2d2d7;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover { background-color: #e8e8ed; }
+        """)
+        btn_browse.clicked.connect(self._browse_out)
+        out_lay.addWidget(btn_browse)
+
+        self.chk_audit = QtWidgets.QCheckBox("Auto Gap-Audit && Retry Missing")
+        self.chk_audit.setChecked(True)
+        out_lay.addWidget(self.chk_audit)
+        layout.addWidget(out_group)
+
+        # Unified Action Pill Bar: Single Start/Stop Toggle + Status Label + Sleek 4px Progress Line
+        ctrl_card = QtWidgets.QFrame()
+        ctrl_card.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #d2d2d7;
+                border-radius: 10px;
+            }
+        """)
+        ctrl_v = QtWidgets.QVBoxLayout(ctrl_card)
+        ctrl_v.setContentsMargins(12, 8, 12, 8)
+        ctrl_v.setSpacing(6)
+
+        act_row = QtWidgets.QHBoxLayout()
+        act_row.setSpacing(12)
+
+        self.btn_toggle_scan = QtWidgets.QPushButton("▶  Start Custom Scan")
+        self.btn_toggle_scan.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_toggle_scan.setFixedHeight(32)
+        self.btn_toggle_scan.setMinimumWidth(185)
+        self.btn_toggle_scan.clicked.connect(self.toggle_scan)
+        self._apply_toggle_btn_style(running=False)
+        act_row.addWidget(self.btn_toggle_scan)
+
+        self.status_pill_lbl = QtWidgets.QLabel("Ready to scan")
+        self.status_pill_lbl.setStyleSheet("color: #6e6e73; font-size: 12px; font-weight: 500; border: none;")
+        act_row.addWidget(self.status_pill_lbl, 1)
+
+        self.pct_lbl = QtWidgets.QLabel("0%")
+        self.pct_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.pct_lbl.setStyleSheet("""
+            QLabel {
+                color: #1d1d1f;
+                background-color: #f5f5f7;
+                border: 1px solid #e5e5ea;
+                border-radius: 6px;
+                padding: 3px 10px;
+                font-size: 12px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+        """)
+        act_row.addWidget(self.pct_lbl)
+
+        ctrl_v.addLayout(act_row)
+
+        self.prog_bar = QtWidgets.QProgressBar()
+        self.prog_bar.setFixedHeight(4)
+        self.prog_bar.setTextVisible(False)
+        self.prog_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                border-radius: 2px;
+                background-color: #e5e5ea;
+            }
+            QProgressBar::chunk {
+                background-color: #0071e3;
+                border-radius: 2px;
+            }
+        """)
+        self.prog_bar.setValue(0)
+        ctrl_v.addWidget(self.prog_bar)
+        layout.addWidget(ctrl_card)
+
+        # Live Table with Animated Active-Row Highlight
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "Year", "DOY", "Date (UTC)", "Station", "Status", "OK / Total", "Missing Slots"
+        ])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+
+
+        # Gentle pulse timer for active scanning row background shimmer
+        self._row_anim_timer = QtCore.QTimer(self)
+        self._row_anim_timer.setInterval(120)
+        self._row_anim_timer.timeout.connect(self._animate_active_row)
+
+    def _apply_toggle_btn_style(self, running=False):
+        if running:
+            self.btn_toggle_scan.setText("⏹  Stop Scan")
+            self.btn_toggle_scan.setStyleSheet("""
+                QPushButton {
+                    background-color: #fff1f0;
+                    color: #d92d20;
+                    border: 1px solid #fecdca;
+                    border-radius: 7px;
+                    padding: 5px 16px;
+                    font-weight: 600;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #fee4e2;
+                    border-color: #fda29b;
+                }
+                QPushButton:disabled {
+                    background-color: #f5f5f7;
+                    color: #86868b;
+                    border-color: #d2d2d7;
+                }
+            """)
+        else:
+            self.btn_toggle_scan.setText("▶  Start Custom Scan")
+            self.btn_toggle_scan.setStyleSheet("""
+                QPushButton {
+                    background-color: #0071e3;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 7px;
+                    padding: 5px 16px;
+                    font-weight: 600;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #0077ed;
+                }
+                QPushButton:disabled {
+                    background-color: #a1c6ea;
+                    color: #ffffff;
+                }
+            """)
+
+    def _animate_active_row(self):
+        if self._active_row_idx is None or self._active_row_idx >= self.table.rowCount():
+            return
+        self._pulse_phase = (self._pulse_phase + 1) % 12
+        # Soft pastel sky-blue shimmer (#f2f8ff -> #dfeeff -> #f2f8ff)
+        wave = abs(6 - self._pulse_phase) / 6.0
+        r = int(242 - 19 * wave)
+        g = int(248 - 10 * wave)
+        b = 255
+        bg = QtGui.QBrush(QtGui.QColor(r, g, b))
+        for c in range(self.table.columnCount()):
+            it = self.table.item(self._active_row_idx, c)
+            if it:
+                it.setBackground(bg)
+
+    def _browse_out(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder for Custom Scan", self.out_input.text())
+        if folder:
+            self.out_input.setText(folder)
+
+    def _parse_stations(self):
+        raw = re.split(r"[,\s;]+", self.st_input.text().strip())
+        out = []
+        for s in raw:
+            s = s.strip().upper()
+            if len(s) in (4, 9) and s not in out:
+                out.append(s)
+        return out
+
+    def _build_date_list(self):
+        dates = []
+        if self.rb_single.isChecked():
+            y = self.single_year.value()
+            max_d = 366 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 365
+            for token in re.split(r"[,\s;]+", self.single_doys.text().strip()):
+                if not token:
+                    continue
+                if "-" in token:
+                    a, b = token.split("-", 1)
+                    if a.isdigit() and b.isdigit():
+                        for d in range(max(1, int(a)), min(max_d, int(b)) + 1):
+                            if (y, d) not in dates:
+                                dates.append((y, d))
+                elif token.isdigit():
+                    d = int(token)
+                    if 1 <= d <= max_d and (y, d) not in dates:
+                        dates.append((y, d))
+        else:
+            d1 = dt.date(self.from_year.value(), 1, 1) + dt.timedelta(days=self.from_doy.value() - 1)
+            d2 = dt.date(self.to_year.value(), 1, 1) + dt.timedelta(days=self.to_doy.value() - 1)
+            if d1 > d2:
+                d1, d2 = d2, d1
+            cur = d1
+            while cur <= d2:
+                dates.append((cur.year, cur.timetuple().tm_yday))
+                cur += dt.timedelta(days=1)
+        return dates
+
+    def check_station_availability(self):
+        stations = self._parse_stations()
+        if not stations:
+            QtWidgets.QMessageBox.warning(self, "Station Required", "Enter at least one 4-char or 9-char station ID.")
+            return
+        if getattr(self, "_probe_worker", None) and self._probe_worker.isRunning():
+            return
+
+        self.btn_verify_st.setEnabled(False)
+        self.btn_verify_st.setText("Checking…")
+        self.avail_lbl.setText(f"<span style='color:#0071e3;'>Checking CDDIS baseline for {', '.join(stations)}…</span>")
+
+        self._probe_worker = StationProbeWorker(
+            self.session, stations, self.dtype_combo.currentText(), parent=self
+        )
+        def _on_probe_done(html_res):
+            self.btn_verify_st.setEnabled(True)
+            self.btn_verify_st.setText("Check Station Availability")
+            self.avail_lbl.setText(html_res)
+
+        self._probe_worker.finished_probe.connect(_on_probe_done)
+        self._probe_worker.start()
+
+    def toggle_scan(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.btn_toggle_scan.setEnabled(False)
+            self.status_pill_lbl.setText("Stopping scan after current slot…")
+            return
+        self.start_scan()
+
+    def _prefill_queue_rows(self, stations, dates):
+        self.table.setRowCount(0)
+        for (y, d) in dates:
+            d_str = (dt.date(y, 1, 1) + dt.timedelta(days=d - 1)).strftime("%Y-%m-%d")
+            for st in stations:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                vals = [str(y), f"{d:03d}", d_str, st, "QUEUED", "–", "–"]
+                for c, v in enumerate(vals):
+                    it = QtWidgets.QTableWidgetItem(v)
+                    if c == 4:
+                        it.setForeground(QtGui.QBrush(QtGui.QColor("#86868b")))
+                    self.table.setItem(r, c, it)
+
+    def start_scan(self):
+        stations = self._parse_stations()
+        if not stations:
+            QtWidgets.QMessageBox.warning(self, "Station Required", "Enter at least one station ID.")
+            return
+        dates = self._build_date_list()
+        if not dates:
+            QtWidgets.QMessageBox.warning(self, "Date Range Invalid", "Specify at least one valid Year and DOY.")
+            return
+        out_dir = self.out_input.text().strip()
+        if not out_dir:
+            QtWidgets.QMessageBox.warning(self, "Output Folder Required", "Select an output folder.")
+            return
+
+        self._prefill_queue_rows(stations, dates)
+        self._apply_toggle_btn_style(running=True)
+        self.btn_toggle_scan.setEnabled(True)
+        self.status_pill_lbl.setText("Initializing scan…")
+        self.pct_lbl.setText("0%")
+        self.pct_lbl.setStyleSheet("""
+            QLabel {
+                color: #0071e3;
+                background-color: #eef6ff;
+                border: 1px solid #cce3ff;
+                border-radius: 6px;
+                padding: 3px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+        """)
+        self._row_anim_timer.start()
+
+        self.worker = CustomScanWorker(
+            self.session,
+            self.dtype_combo.currentText(),
+            stations,
+            dates,
+            out_dir,
+            auto_audit=self.chk_audit.isChecked(),
+            parent=self
+        )
+        self.worker.log.connect(self._on_worker_notice)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.row_scanning.connect(self._on_row_scanning)
+        self.worker.row_ready.connect(self._on_row_ready)
+        self.worker.finished_all.connect(self._on_finished)
+        self.worker.start()
+
+    def _find_row(self, year, doy, station):
+        y_str = str(year)
+        d_str = f"{doy:03d}"
+        st_u = station.upper()
+        for r in range(self.table.rowCount()):
+            if (
+                self.table.item(r, 0).text() == y_str
+                and self.table.item(r, 1).text() == d_str
+                and self.table.item(r, 3).text() == st_u
+            ):
+                return r
+        return None
+
+    def _on_row_scanning(self, year, doy, station, phase_text):
+        r = self._find_row(year, doy, station)
+        if r is None:
+            return
+        self._active_row_idx = r
+        self.table.scrollToItem(self.table.item(r, 0), QtWidgets.QAbstractItemView.EnsureVisible)
+        st_item = self.table.item(r, 4)
+        if st_item:
+            st_item.setText(phase_text)
+            st_item.setForeground(QtGui.QBrush(QtGui.QColor("#0071e3")))
+            f = st_item.font()
+            f.setBold(True)
+            st_item.setFont(f)
+
+    def _on_worker_notice(self, msg):
+        if "[THROTTLE GUARD]" in msg or "Audit" in msg or "[RECOVERED]" in msg:
+            self.status_pill_lbl.setText(msg.replace("[THROTTLE GUARD] ", ""))
+
+    def _on_progress(self, cur, tot, msg):
+        safe_tot = max(1, tot)
+        pct = int(round((cur / safe_tot) * 100))
+        self.prog_bar.setMaximum(safe_tot)
+        self.prog_bar.setValue(cur)
+        self.status_pill_lbl.setText(msg)
+        self.pct_lbl.setText(f"{pct}%")
+
+    def _on_row_ready(self, rec):
+        target_row = self._find_row(rec["year"], rec["doy"], rec["station"])
+        if target_row is None:
+            target_row = self.table.rowCount()
+            self.table.insertRow(target_row)
+
+        if self._active_row_idx == target_row:
+            self._active_row_idx = None
+
+        # Settle row background to a clean, subtle Apple pastel tint
+        if rec["status"] == "COMPLETE":
+            row_bg = QtGui.QBrush(QtGui.QColor("#f6fef9"))
+            fg_color = "#15803d"
+        elif rec["status"] == "PARTIAL":
+            row_bg = QtGui.QBrush(QtGui.QColor("#fffcf5"))
+            fg_color = "#c2410c"
+        else:
+            row_bg = QtGui.QBrush(QtGui.QColor("#fffafa"))
+            fg_color = "#d92d20"
+
+        vals = [
+            str(rec["year"]),
+            f"{rec['doy']:03d}",
+            rec["date_str"],
+            rec["station"],
+            rec["status"],
+            f"{rec['ok_cnt']}/{rec['total_cnt']}",
+            rec["missing_str"]
+        ]
+        for c, v in enumerate(vals):
+            it = QtWidgets.QTableWidgetItem(v)
+            it.setBackground(row_bg)
+            if c == 4:
+                it.setForeground(QtGui.QBrush(QtGui.QColor(fg_color)))
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            self.table.setItem(target_row, c, it)
+
+    def _on_finished(self, summary_path, records):
+        self._row_anim_timer.stop()
+        self._active_row_idx = None
+        self._apply_toggle_btn_style(running=False)
+        self.btn_toggle_scan.setEnabled(True)
+        self.status_pill_lbl.setText(f"Completed · {len(records)} station-day(s) audited")
+        self.pct_lbl.setText("100%")
+        self.pct_lbl.setStyleSheet("""
+            QLabel {
+                color: #15803d;
+                background-color: #f0fdf4;
+                border: 1px solid #bbf7d0;
+                border-radius: 6px;
+                padding: 3px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+        """)
+        QtWidgets.QMessageBox.information(
+            self,
+            "Custom Scan & Audit Complete",
+            f"All DOY reports and consolidated summary saved to:\n{summary_path}"
+        )
+
+class ConnectionCheckWorker(QtCore.QThread):
+    # emits (status_code, pill_text, detail_report)
+    # status_code: "connected", "expired", "offline"
+    finished_check = QtCore.Signal(str, str, str)
+
+    def __init__(self, session, repair=False, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.repair = repair
+
+    def run(self):
+        import socket
+        import os
+
+        lines = []
+        # Step 1: Reachability to cddis.nasa.gov (supports HTTP/HTTPS proxy environments)
+        proxy_url = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+        )
+        if not proxy_url and self.session is not None and getattr(self.session, "proxies", None):
+            proxy_url = self.session.proxies.get("https") or self.session.proxies.get("http")
+
+        try:
+            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+            r_head = requests.head(
+                "https://cddis.nasa.gov/archive/",
+                proxies=proxies,
+                timeout=8,
+                allow_redirects=False,
+            )
+            via = f"via proxy ({proxy_url})" if proxy_url else "via direct HTTPS"
+            lines.append(f"✔ [1/4] Network: Reachable {via} [HTTP {r_head.status_code}].")
+        except Exception as e:
+            lines.append(f"✖ [1/4] Network: Cannot reach cddis.nasa.gov ({e}).")
+            self.finished_check.emit("offline", "Disconnected", "\n".join(lines))
+            return
+            current_tz = self.settings.value("display_tz", "IST (UTC+05:30)")
+            try:
+                curr_idx = tz_keys.index(current_tz)
+                next_idx = (curr_idx + 1) % len(tz_keys)
+            except ValueError:
+                next_idx = 0
+            new_tz = tz_keys[next_idx]
+            self.settings.setValue("display_tz", new_tz)
+            if hasattr(self, "tz_combo"):
+                self.tz_combo.setCurrentText(new_tz)
+            self._update_all_tz_columns(new_tz)
+
+    def _set_timezone(self, tz_name):
+        self.settings.setValue("display_tz", tz_name)
+        self._update_all_tz_columns(tz_name)
+        self.log(f"Timezone switched to: {tz_name}")
+
+    def _on_tz_combo_changed(self, index):
+        tz_name = self.tz_combo.currentText()
+        self.settings.setValue("display_tz", tz_name)
+        self._update_all_tz_columns(tz_name)
+        self.log(f"Display timezone updated to: {tz_name}")
+
+    def _update_all_tz_columns(self, tz_name):
+        tz_tag = tz_name.split()[0]
+        header_text = tz_tag
+
+        if hasattr(self, "table"):
+            self.table.setHorizontalHeaderItem(8, QtWidgets.QTableWidgetItem(header_text))
+        if hasattr(self, "station_tables"):
+            for tbl in self.station_tables.values():
+                tbl.setHorizontalHeaderItem(8, QtWidgets.QTableWidgetItem(header_text))
+
+        if hasattr(self, "log_group") and self.log_group:
+            self.log_group.setTitle(f"Activity Work Log ({header_text})")
+
+        active_tz = getattr(self, "TIMEZONES", {}).get(tz_name, dt.timezone.utc)
+
+        def _recalc_table(tbl):
+            for row in range(tbl.rowCount()):
+                utc_item = tbl.item(row, 7)
+                if utc_item and utc_item.text() and "-" not in utc_item.text():
+                    try:
+                        raw_utc = utc_item.text().replace(" UTC", "").strip()
+                        parts = raw_utc.split(":")
+                        if len(parts) == 3:
+                            now_u = dt.datetime.now(dt.timezone.utc).replace(
+                                hour=int(parts[0]), minute=int(parts[1]), second=int(parts[2])
+                            )
+                            loc_str = now_u.astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+                            tbl.setItem(row, 8, QtWidgets.QTableWidgetItem(loc_str))
+                    except Exception:
+                        pass
+
+        if hasattr(self, "table"):
+            _recalc_table(self.table)
+        if hasattr(self, "station_tables"):
+            for tbl in self.station_tables.values():
+                _recalc_table(tbl)
+
+    def log(self, msg):
+        try:
+            tz_name = self.settings.value("display_tz", "IST (UTC+05:30)")
+            tz_tag = tz_name.split()[0]
+            target_tz = getattr(self, "TIMEZONES", {}).get(tz_name, dt.timezone.utc)
+            now_dt = dt.datetime.now(dt.timezone.utc).astimezone(target_tz)
+            ts = now_dt.strftime(f"[%Y-%m-%d %H:%M:%S {tz_tag}]")
+        except Exception:
+            ts = dt.datetime.now(dt.timezone.utc).strftime("[%Y-%m-%d %H:%M:%S UTC]")
+
+        if not hasattr(self, "logbox") or self.logbox is None:
+            return
+
+        if msg.startswith("PROGRESS:"):
+            clean_text = f"{ts} {msg[9:]}"
+            if getattr(self, "_progress_active", False) and self.logbox.document().blockCount() > 0:
+                cursor = QtGui.QTextCursor(self.logbox.document().lastBlock())
+                cursor.select(QtGui.QTextCursor.BlockUnderCursor)
+                cursor.insertText(clean_text)
+            else:
+                self.logbox.appendPlainText(clean_text)
+                self._progress_active = True
+            return
+
+        self._progress_active = False
+        line = f"{ts} {msg}"
+        self.logbox.appendPlainText(line)
+
+    def _make_table(self):
+        t = QtWidgets.QTableWidget(0, len(self.COLS))
+        t.setHorizontalHeaderLabels(self.COLS)
+        t.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        t.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        hh = t.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(8, QtWidgets.QHeaderView.ResizeToContents)
+        hh.sectionClicked.connect(self._on_header_clicked)
+        return t
+
+    def _pulse_heartbeat(self):
+        self._hb_state = not self._hb_state
+        self.hb_led.setStyleSheet(f"color: {"#0071e3" if self._hb_state else "#a1a1a6"}; font-size: 10px; border: none; background: transparent; padding-left: 2px;")
+
+    def _on_tz_changed(self, text):
+        self.settings.setValue("display_tz", text)
+        tz_tag = text.split()[0]
+        new_header_title = "IST"
+        self.COLS[-1] = new_header_title
+        
+        # Update header title across all active tables
+        if hasattr(self, "table"):
+            self.table.setHorizontalHeaderItem(8, QtWidgets.QTableWidgetItem(new_header_title))
+        if hasattr(self, "station_tables"):
+            for stn_tbl in self.station_tables.values():
+                stn_tbl.setHorizontalHeaderItem(8, QtWidgets.QTableWidgetItem(new_header_title))
+
+        # Re-convert visible rows if rows exist
+        if hasattr(self, "_last_rows") and self._last_rows:
+            self.on_results(self._last_rows)
+
+    def _update_heartbeat_timestamp(self):
+        now_str = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S UTC")
+        self.hb_label.setText(f"Live | Updated: {now_str}")
+
+    def _on_stn_text_changed(self, text):
+        current = text.strip()
+        last = getattr(self, "_last_synced_stns", "")
+        if current != last:
+            self.btn_sync_stns.show()
+        else:
+            self.btn_sync_stns.hide()
+
+    def _hot_sync_stations(self):
+        new_text = getattr(self, "stations", getattr(self, "stn_input", None)).text().strip()
+        self._last_synced_stns = new_text
+        self.btn_sync_stns.hide()
+        self.settings.setValue("stations", new_text)
+
+        stations = self.parse_stations()
+        if not stations:
+            return
+
+        self.log(f"Hot-synced stations: {', '.join(stations)}")
+        self._sync_station_tabs(stations)
+        self.refresh_doy_strip()
+
+        if getattr(self, "latest_rows", None):
+            existing_stns = set(r["station"].upper() for r in self.latest_rows)
+            new_stns = [s for s in stations if s not in existing_stns]
+            if new_stns:
+                self.log(f"Hot-sync: Running targeted scan for newly added station(s): {', '.join(new_stns)}")
+                self._preserve_existing_rows = True
+                self.stations.blockSignals(True)
+                self.stations.setText(", ".join(new_stns))
+                self.stations.blockSignals(False)
+                self.run_check(trigger_catchup_on_finish=False)
+                self.stations.blockSignals(True)
+                self.stations.setText(", ".join(stations))
+                self.stations.blockSignals(False)
+            else:
+                self.log("Hot-sync: All stations are already present in current results.")
+        else:
+            self.run_check(trigger_catchup_on_finish=False)
+
+    def _append_new_station_slots(self, new_stations, slots, is_hourly):
+        self._sync_station_tabs(self.parse_stations())
+        current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+        active_tz = getattr(self, "TIMEZONES", TIMEZONES).get(current_tz_name, dt.timezone.utc)
+        tz_tag = current_tz_name.split()[0]
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        now_local = now_dt.astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+
+        for slot in slots:
+            if is_hourly:
+                hh = slot.hour
+                slot_disp = f"Hour {hh:02d}  ({hh:02d}:00 - {(hh + 1) % 24:02d}:00 UTC)"
+            else:
+                slot_disp = f"DOY {slot.timetuple().tm_yday:03d} (Full Day UTC)"
+
+            for stn in new_stations:
+                row_idx = self.table.rowCount()
+                self.table.insertRow(row_idx)
+                stn_tbl = self.station_tables.get(stn.upper())
+                stn_row_idx = stn_tbl.rowCount() if stn_tbl else None
+                if stn_tbl:
+                    stn_tbl.insertRow(stn_row_idx)
+
+                vals = [stn.upper(), slot_disp, "PENDING", "-", "0/1", "–", "–", now_dt.strftime("%H:%M:%S UTC"), now_local]
+                for j, v in enumerate(vals):
+                    it = QtWidgets.QTableWidgetItem(v)
+                    if j == 2:
+                        it.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                        it.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS["PENDING"])))
+                        f = it.font()
+                        f.setBold(True)
+                        it.setFont(f)
+                    self.table.setItem(row_idx, j, it)
+                    if stn_tbl:
+                        it_s = QtWidgets.QTableWidgetItem(v)
+                        if j == 2:
+                            it_s.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                            it_s.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS["PENDING"])))
+                            f_s = it_s.font()
+                            f_s.setBold(True)
+                            it_s.setFont(f_s)
+                        stn_tbl.setItem(stn_row_idx, j, it_s)
+
+    def _get_cached_slot_timestamp(self, station, hour_idx):
+        try:
+            doy = int(self.doy_spin.value())
+            year = int(self.year_spin.value())
+            root = self.report_path.text().strip()
+            live_path = os.path.join(root, station, f"{year}_DOY{doy:03d}_live.json")
+            if os.path.exists(live_path):
+                with open(live_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                slot_info = data.get("slots", {}).get(f"{hour_idx:02d}", {})
+                if slot_info.get("status") in ("OK", "VERIFIED") and slot_info.get("checked_utc"):
+                    return slot_info.get("checked_utc")
+        except Exception:
+            pass
+        return None
+
+    def _save_slot_to_live_cache(self, station, hour_idx, status, uploaded_files, checked_utc):
+        try:
+            doy = int(self.doy_spin.value())
+            year = int(self.year_spin.value())
+            root = self.report_path.text().strip()
+            stn_dir = os.path.join(root, station)
+            os.makedirs(stn_dir, exist_ok=True)
+            live_path = os.path.join(stn_dir, f"{year}_DOY{doy:03d}_live.json")
+
+            data = {"year": year, "doy": doy, "station": station, "slots": {}}
+            if os.path.exists(live_path):
+                try:
+                    with open(live_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    pass
+
+            # Only lock arrival timestamp if not already locked
+            existing_slot = data.setdefault("slots", {}).get(f"{hour_idx:02d}", {})
+            if existing_slot.get("status") == "OK" and existing_slot.get("checked_utc"):
+                locked_ts = existing_slot.get("checked_utc")
+            else:
+                locked_ts = checked_utc
+
+            data["slots"][f"{hour_idx:02d}"] = {
+                "status": status,
+                "files": uploaded_files,
+                "checked_utc": locked_ts
+            }
+
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            return locked_ts
+        except Exception as e:
+            return checked_utc
+
+    def _sync_station_tabs(self, target_stations):
+        """Adds missing tabs and removes obsolete tabs so UI exactly matches the Stations config."""
+        import re
+        target_upper = set(s.upper() for s in target_stations if s.strip())
+
+        # 1. Remove tabs that are no longer in target_stations
+        idx = 1  # Index 0 is always 'All Stations'
+        while idx < self.station_tabs.count():
+            tab_text = self.station_tabs.tabText(idx)
+            cleaned = re.sub(r'^[⚪🟢🔴⚠️\s]+', '', tab_text)
+            cleaned = re.sub(r'\(.*?\)', '', cleaned).strip()
+            raw_stn = cleaned.split()[0].upper() if cleaned else ""
+
+            if raw_stn and raw_stn not in target_upper:
+                self.station_tabs.removeTab(idx)
+                if raw_stn in self.station_tables:
+                    del self.station_tables[raw_stn]
+            else:
+                idx += 1
+
+        # 2. Add tabs for newly configured stations
+        for stn in target_stations:
+            stn_u = stn.upper()
+            if stn_u not in self.station_tables:
+                stn_tbl = self._make_table()
+                self.station_tables[stn_u] = stn_tbl
+                self.station_tabs.addTab(stn_tbl, f"⚪ {stn_u}")
+
+    def _prefill_slots(self, stations, slots, is_hourly):
+        self.table.setRowCount(0)
+        self._sync_station_tabs(stations)
+        for stn in stations:
+            stn_u = stn.upper()
+            if stn_u in self.station_tables:
+                self.station_tables[stn_u].setRowCount(0)
+
+        current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+        active_tz = getattr(self, "TIMEZONES", TIMEZONES).get(current_tz_name, dt.timezone.utc)
+        tz_tag = current_tz_name.split()[0]
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        now_local = now_dt.astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+
+        for slot in slots:
+            if is_hourly:
+                hh = slot.hour
+                slot_disp = f"Hour {hh:02d}  ({hh:02d}:00 - {(hh + 1) % 24:02d}:00 UTC)"
+            else:
+                slot_disp = f"DOY {slot.timetuple().tm_yday:03d} (Full Day UTC)"
+
+            for stn in stations:
+                row_idx = self.table.rowCount()
+                self.table.insertRow(row_idx)
+                stn_tbl = self.station_tables.get(stn)
+                stn_row_idx = stn_tbl.rowCount() if stn_tbl else None
+                if stn_tbl:
+                    stn_tbl.insertRow(stn_row_idx)
+
+                vals = [stn, slot_disp, "PENDING", "-", "0/1", "–", "–", now_dt.strftime("%H:%M:%S UTC"), now_local]
+                for j, v in enumerate(vals):
+                    it = QtWidgets.QTableWidgetItem(v)
+                    if j == 2:
+                        it.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                        it.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS["PENDING"])))
+                        f = it.font()
+                        f.setBold(True)
+                        it.setFont(f)
+                    self.table.setItem(row_idx, j, it)
+                    if stn_tbl:
+                        it_s = QtWidgets.QTableWidgetItem(v)
+                        if j == 2:
+                            it_s.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                            it_s.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS["PENDING"])))
+                            f_s = it_s.font()
+                            f_s.setBold(True)
+                            it_s.setFont(f_s)
+                        stn_tbl.setItem(stn_row_idx, j, it_s)
+
+    def _save_slot_to_live_state(self, r):
+        try:
+            import json
+            root = self.report_path.text().strip() or os.path.expanduser("~/Downloads/CDDM")
+            stn = r["station"].upper()
+            year = int(r["year"])
+            doy = int(r["doy"])
+            hh_str = str(r.get("hour_str", "00"))
+            stn_dir = os.path.join(root, stn)
+            os.makedirs(stn_dir, exist_ok=True)
+            live_path = os.path.join(stn_dir, f"{year}_DOY{doy:03d}_live.json")
+
+            data = {"year": year, "doy": doy, "station": stn, "slots": {}}
+            if os.path.exists(live_path):
+                try:
+                    with open(live_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    pass
+
+            checked_str = r["checked"].strftime("%H:%M:%S UTC") if hasattr(r.get("checked"), "strftime") else str(r.get("checked", "-"))
+            existing_slot = data.setdefault("slots", {}).get(hh_str, {})
+            if existing_slot.get("status") == "OK" and existing_slot.get("checked_utc"):
+                locked_ts = existing_slot["checked_utc"]
+            else:
+                locked_ts = checked_str
+
+            data["slots"][hh_str] = {
+                "status": r.get("status", "PENDING"),
+                "files": r.get("filenames", "-"),
+                "checked_utc": locked_ts,
+            }
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def on_slot_checked(self, r):
+        hh = r["slot"].hour if hasattr(r["slot"], "hour") else 0
+        self.hb_led.setStyleSheet("color: #ff9500; font-size: 13px; border: none; background: transparent;")
+        self.hb_label.setText(f"Scanning Hr {hh:02d} ({r.get('station', '')})...")
+        
+        is_hr = self._hourly()
+        target_slot_match = f"Hour {hh:02d}" if is_hr else f"DOY {r['doy']:03d}"
+        if is_hr:
+            slot_disp = f"Hour {hh:02d}  ({hh:02d}:00 - {(hh + 1) % 24:02d}:00 UTC)"
+        else:
+            slot_disp = f"DOY {r['doy']:03d} (Full Day UTC)"
+
+        current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+        active_tz = getattr(self, "TIMEZONES", TIMEZONES).get(current_tz_name, dt.timezone.utc)
+        tz_tag = current_tz_name.split()[0]
+        local_time = r["checked"].astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+
+        vals = [
+            r["station"], slot_disp, r["status"], r["filenames"],
+            f"{r['files']}/{r['expected']}",
+            f"{r['size'] / 1024:.1f} KB" if r["size"] else "–",
+            r["mod"] or "–",
+            r["checked"].strftime("%H:%M:%S UTC"),
+            local_time
+        ]
+
+        def _update_tbl(tbl):
+            for row in range(tbl.rowCount()):
+                stn_i = tbl.item(row, 0)
+                slot_i = tbl.item(row, 1)
+                if stn_i and slot_i and stn_i.text().strip().upper() == r["station"].strip().upper():
+                    if target_slot_match in slot_i.text():
+                        for col_idx, val in enumerate(vals):
+                            it = QtWidgets.QTableWidgetItem(val)
+                            if col_idx == 2:
+                                it.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                                it.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS.get(r["status"], "#757575"))))
+                                f = it.font()
+                                f.setBold(True)
+                                it.setFont(f)
+                            tbl.setItem(row, col_idx, it)
+                        break
+
+        _update_tbl(self.table)
+        self._save_slot_to_live_state(r)
+        stn_tbl = self.station_tables.get(r["station"])
+        if stn_tbl:
+            _update_tbl(stn_tbl)
+
+    def on_results(self, rows):
+        self.scan_progress.hide()
+        current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+        active_tz = getattr(self, "TIMEZONES", {}).get(current_tz_name, dt.timezone.utc)
+        tz_tag = current_tz_name.split()[0]
+        now_str = dt.datetime.now(dt.timezone.utc).astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+        self.hb_led.setStyleSheet("color: #0071e3; font-size: 13px; border: none; background: transparent;")
+        self.hb_label.setText(f"Live  |  Updated: {now_str}")
+        self._last_rows = rows
+        if not hasattr(self, "_verified_history"):
+            self._verified_history = {}
+
+        # Preserve original checked timestamps for established OK slots
+        for r in rows:
+            key = (r["station"], r["year"], r["doy"], r["slot"])
+            if key in self._verified_history and self._verified_history[key]["status"] == "OK":
+                r["checked"] = self._verified_history[key]["checked"]
+            elif r["status"] == "OK":
+                self._verified_history[key] = {
+                    "status": "OK",
+                    "checked": r["checked"]
+                }
+        self.alerted.discard("connection")
+        if getattr(self, "_preserve_existing_rows", False) and getattr(self, "latest_rows", None):
+
+            scanned_stns = {r["station"].upper() for r in rows}
+
+            kept_rows = [r for r in self.latest_rows if r["station"].upper() not in scanned_stns]
+
+            rows = kept_rows + rows
+
+            self._preserve_existing_rows = False
+
+        self.latest_rows = rows
+
+        rows.sort(key=lambda r: (r["slot"], r["station"]))
+
+        counts = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+        self.table.setRowCount(0)
+        
+        configured_stns = self.parse_stations()
+        self._sync_station_tabs(configured_stns)
+        for stn in configured_stns:
+            stn_u = stn.upper()
+            if stn_u in self.station_tables:
+                self.station_tables[stn_u].setRowCount(0)
+
+        active_stns = sorted(list(set(r["station"] for r in rows)))
+        stn_has_missing = {stn: False for stn in active_stns}
+
+        current_header_str = None
+        row_idx = 0
+
+        for r in rows:
+            stn = r["station"]
+            if r["status"] == "MISSING":
+                stn_has_missing[stn] = True
+            doy_num = r["doy"]
+            cal_str = r["slot"].strftime("%Y-%m-%d (%a, %d %b %Y)")
+            header_str = f"📅 Year {r["year"]}  ·  DOY {doy_num:03d}  ·  {cal_str} (UTC)"
+            if hasattr(self, "calendar_strip") and header_str != current_header_str:
+                current_header_str = header_str
+                self.calendar_strip.setText(header_str)
+
+            if self._hourly():
+                hh = r["slot"].hour
+                slot_display = f"Hour {hh:02d}  ({hh:02d}:00 - {(hh + 1) % 24:02d}:00 UTC)"
+            else:
+                slot_display = f"DOY {r['doy']:03d} (Full Day UTC)"
+
+            current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+            active_tz = getattr(self, "TIMEZONES", TIMEZONES).get(current_tz_name, dt.timezone.utc)
+            tz_tag = current_tz_name.split()[0]
+            local_time_str = r["checked"].astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+
+            vals = [
+                r["station"],
+                slot_display,
+                r["status"],
+                r["filenames"],
+                f"{r["files"]}/{r["expected"]}",
+                f"{r["size"] / 1024:.1f} KB" if r["size"] else "–",
+                r["mod"] or "–",
+                r["checked"].strftime("%H:%M:%S UTC"),
+                local_time_str
+            ]
+
+            self.table.insertRow(row_idx)
+            stn_tbl = self.station_tables.get(stn)
+            stn_row_idx = stn_tbl.rowCount() if stn_tbl else None
+            if stn_tbl is not None:
+                stn_tbl.insertRow(stn_row_idx)
+
+            for j, v in enumerate(vals):
+                it = QtWidgets.QTableWidgetItem(v)
+                if j == 2:
+                    it.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                    it.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS[r["status"]])))
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                self.table.setItem(row_idx, j, it)
+
+                if stn_tbl is not None:
+                    it_stn = QtWidgets.QTableWidgetItem(v)
+                    if j == 2:
+                        it_stn.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+                        it_stn.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS[r["status"]])))
+                        f_stn = it_stn.font()
+                        f_stn.setBold(True)
+                        it_stn.setFont(f_stn)
+                    stn_tbl.setItem(stn_row_idx, j, it_stn)
+
+            row_idx += 1
+
+        for idx in range(1, self.station_tabs.count()):
+            tab_text = self.station_tabs.tabText(idx)
+            # Strip emojis, symbols, and parenthetical notes to keep the exact station code
+            cleaned = re.sub(r'^[⚪🟢🔴⚠️\s]+', '', tab_text)
+            cleaned = re.sub(r'\(.*?\)', '', cleaned).strip()
+            raw_stn = cleaned.split()[0] if cleaned else tab_text.strip()
+            
+            # Find all scanned rows for this station
+            stn_rows = [r for r in rows if r["station"].upper() == raw_stn.upper()]
+            missing_cnt = sum(1 for r in stn_rows if r["status"] == "MISSING")
+            ok_cnt = sum(1 for r in stn_rows if r["status"] == "OK")
+            pending_cnt = sum(1 for r in stn_rows if r["status"] == "PENDING")
+
+            # If every single completed slot is missing (0 OK), mark as No Feed
+            if len(stn_rows) > 0 and ok_cnt == 0 and missing_cnt > 0:
+                self.station_tabs.setTabText(idx, f"⚠️ {raw_stn} (No Feed)")
+            elif missing_cnt > 0:
+                self.station_tabs.setTabText(idx, f"🔴 {raw_stn}")
+            else:
+                self.station_tabs.setTabText(idx, f"🟢 {raw_stn}")
+
+        self.scan_progress.hide()
+        current_tz_name = self.tz_combo.currentText() if hasattr(self, "tz_combo") else "IST (UTC+05:30)"
+        active_tz = getattr(self, "TIMEZONES", TIMEZONES).get(current_tz_name, dt.timezone.utc)
+        tz_tag = current_tz_name.split()[0]
+        now_local = dt.datetime.now(dt.timezone.utc).astimezone(active_tz).strftime(f"%H:%M:%S {tz_tag}")
+        self.hb_label.setText(f"Live  |  Updated: {now_local}")
+        self.hb_led.setStyleSheet("color: #0071e3; font-size: 10px; border: none; background: transparent;")
+
+        if self.is_monitoring:
+            self._batch_alert_logic(rows)
+
+        if counts.get("MISSING", 0) > 0:
+            self.set_indicator("missing", "MISSING")
+        elif counts.get("PARTIAL", 0) > 0:
+            self.set_indicator("partial", "PARTIAL")
+        else:
+            self.set_indicator("ok", "ALL OK")
+
+        parts = [
+            f"<span style='color:{STATUS_COLORS[k]}'><b>{counts[k]}</b> {k}</span>"
+            for k in ("OK", "PARTIAL", "MISSING", "PENDING") if k in counts
+        ]
+        self.summary.setText(" | ".join(parts) or "No data found")
+        now_str = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S UTC")
+        nxt = f" – next in {self.interval.value()}m" if (self.is_monitoring and self.mode_live.isChecked()) else ""
+        self.statusBar().showMessage(f"Updated at {now_str}{nxt}")
+        self.log(f"Scan complete. Summary: {', '.join(f'{k}={v}' for k, v in counts.items())}")
+        try:
+            target_dir = self.report_path.text().strip() or os.getcwd()
+            cur_year = int(self.year_spin.value())
+            cur_doy = int(self.doy_spin.value())
+            self._save_per_station_doy_files(target_dir, cur_year, cur_doy, rows)
+            self.log(f"Live summary synchronized to <STATION>/{cur_doy:03d}.txt")
+        except Exception as e:
+            self.log(f"Notice: DOY summary auto-save: {e}")
+
+    def _batch_alert_logic(self, rows):
+        missing_items = []
+        partial_items = []
+        recovered_items = []
+
+        for r in rows:
+            key = (r["station"], r["slot"], self.type_box.currentText())
+            time_label = f"DOY {r['doy']:03d} Hr {r['hour_str']} UTC"
+
+            if r["status"] == "MISSING":
+                if key not in self.alerted:
+                    self.alerted.add(key)
+                    missing_items.append(f"• {r['station']} [{time_label}]: 0/{r['expected']} files")
+            elif r["status"] == "PARTIAL":
+                if key not in self.alerted:
+                    self.alerted.add(key)
+                    partial_items.append(f"• {r['station']} [{time_label}]: {r['files']}/{r['expected']} files")
+            elif r["status"] == "OK" and key in self.alerted:
+                self.alerted.discard(key)
+                recovered_items.append(f"• {r['station']} [{time_label}] ({r['filenames']})")
+
+        total_alerts = len(missing_items) + len(partial_items) + len(recovered_items)
+        if total_alerts == 0:
+            return
+
+        body_lines = []
+        if missing_items:
+            body_lines.append(f"MISSING ({len(missing_items)}):")
+            body_lines.extend(missing_items[:5])
+            if len(missing_items) > 5:
+                body_lines.append(f"  ...and {len(missing_items) - 5} more")
+
+        if partial_items:
+            if body_lines:
+                body_lines.append("")
+            body_lines.append(f"PARTIAL ({len(partial_items)}):")
+            body_lines.extend(partial_items[:3])
+
+        if recovered_items:
+            if body_lines:
+                body_lines.append("")
+            body_lines.append(f"RECOVERED ({len(recovered_items)}):")
+            body_lines.extend(recovered_items[:3])
+
+        title = f"CDDIS Alert: {len(missing_items)} Missing, {len(partial_items)} Partial"
+        full_text = "\n".join(body_lines)
+        self.notify(title, full_text)
+
+    def tray_notify(self, title, text):
+        if self.tray and self.tray.isVisible():
+            self.tray.showMessage(title, text, QtWidgets.QSystemTrayIcon.Information, 8000)
+
+    def notify(self, title, text):
+        self.log(f"ALERT NOTIFICATION:\n{text}")
+        if self.tray and self.tray.isVisible():
+            self.tray.showMessage(title, text, QtWidgets.QSystemTrayIcon.Warning, 12000)
+        if shutil.which("notify-send"):
+            try:
+                subprocess.Popen(["notify-send", "-u", "critical", title, text])
+            except Exception:
+                pass
+        # Trigger configured MP3 alert sound with 25s auto-stop
+        self.play_alert_audio(max_duration_sec=25)
+
+    def _check_daily_report_trigger(self):
+        now_local = dt.dt.dt.datetime.now()
+        if now_local.weekday() > 4:
+            return
+
+        today_date = now_local.date()
+        if self.last_daily_report_date == today_date:
+            return
+
+        if (now_local.hour == 16 and now_local.minute >= 30) or now_local.hour > 16:
+            self.last_daily_report_date = today_date
+            self._generate_daily_report(now_local)
+
+    def _generate_daily_report(self, trigger_time):
+        target_dir = self.report_path.text().strip()
+        stations = self.parse_stations()
+        if not stations:
+            return
+
+        self.log("Triggered automated 16:30 Daily Report scan (Past 24 Hours UTC) per station...")
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        hourly = self._hourly()
+        if hourly:
+            cur = now_utc.replace(minute=0, second=0, microsecond=0)
+            slots_24h = [cur - dt.timedelta(hours=i) for i in range(24)]
+        else:
+            today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            slots_24h = [today - dt.timedelta(days=i) for i in range(1, 3)]
+
+        if hasattr(self, "audit_worker") and self.audit_worker is not None:
+            if self.audit_worker.isRunning():
+                self.audit_worker.wait(1500)
+        self.audit_worker = CheckWorker(
+            self.session, self.type_box.currentText(),
+            slots_24h, stations, self.grace.value(), self
+        )
+
+        def write_report_files(rows):
+            by_station = {}
+            for r in rows:
+                by_station.setdefault(r["station"], []).append(r)
+
+            for st, st_rows in by_station.items():
+                try:
+                    st_dir = os.path.join(target_dir, st)
+                    os.makedirs(st_dir, exist_ok=True)
+                    file_path = os.path.join(
+                        st_dir, f"daily_1630_{trigger_time.strftime('%Y%m%d')}_UTC.txt"
+                    )
+                    total = len(st_rows)
+                    counts = {}
+                    for r in st_rows:
+                        counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write("=" * 110 + "\n")
+                        f.write("NASA CDDIS GNSS ARCHIVE - DAILY 16:30 WORKING SUMMARY REPORT (UTC)\n")
+                        f.write(f"Station:      {st}\n")
+                        f.write(f"Generated at: {trigger_time.strftime('%Y-%m-%d %H:%M:%S')} Local Time\n")
+                        f.write(f"Data Type:    {self.type_box.currentText()}\n")
+                        f.write("=" * 96 + "\n\n")
+
+                        f.write("SUMMARY BREAKDOWN:\n")
+                        for st_type in ("OK", "PARTIAL", "MISSING", "PENDING"):
+                            c = counts.get(st_type, 0)
+                            pct = (c / total * 100) if total else 0
+                            f.write(f"  - {st_type:<10}: {c:>3} ({pct:.1f}%)\n")
+                        f.write("\n" + "-" * 96 + "\n")
+                        f.write(
+                            f"{'Station':<10} {'Year/DOY/Hr':<18} {'Status':<10} {'Files':<7} "
+                            f"{'Size (KB)':<10} {'Uploaded File(s)'}\n"
+                        )
+                        f.write("-" * 96 + "\n")
+
+                        for r in sorted(st_rows, key=lambda x: x["slot"]):
+                            slot_str = f"{r['year']}/{r['doy']:03d}/{r['hour_str']}"
+                            f.write(
+                                f"{r['station']:<10} "
+                                f"{slot_str:<18} "
+                                f"{r['status']:<10} "
+                                f"{r['files']}/{r['expected']:<5} "
+                                f"{r['size']/1024:<10.1f} "
+                                f"{r['filenames']}\n"
+                            )
+                        f.write("=" * 110 + "\n")
+                    self.log(f"Daily 16:30 report saved for {st}: {file_path}")
+                except Exception as ex:
+                    self.log(f"Error saving daily 16:30 report for {st}: {ex}")
+
+            self.tray_notify(
+                "Daily 16:30 Summaries Saved",
+                f"Per-station reports saved in {target_dir}/<STATION>/"
+            )
+
+        self.audit_worker.results.connect(write_report_files)
+        self.audit_worker.start()
+
+    def export_csv(self):
+        if not self.latest_rows:
+            self.statusBar().showMessage("No scan results available to export.", 4000)
+            return
+        default_name = os.path.join(
+            self.report_path.text(),
+            f"cddis_doy{self.doy_spin.value():03d}_{dt.dt.dt.datetime.now():%Y%m%d_%H%M}_UTC.csv"
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Results", default_name, "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Station", "Year", "Julian Day (DOY)", "Hour (UTC)",
+                    "Status", "Uploaded File(s)", "Files Count", "Size (KB)",
+                    "Last-Modified", "Checked (UTC)", "IST", "Archive URL"
+                ])
+                for r in self.latest_rows:
+                    writer.writerow([
+                        r["station"],
+                        r["year"],
+                        f"{r['doy']:03d}",
+                        r["hour_str"],
+                        r["status"],
+                        r["filenames"],
+                        f"{r['files']}/{r['expected']}",
+                        f"{r['size'] / 1024:.1f}" if r["size"] else "0",
+                        r["mod"],
+                        r["checked"].strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        r["url"]
+                    ])
+            self.log(f"Exported current table results to CSV: {path}")
+            self.statusBar().showMessage(f"Exported to {path}", 5000)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export Failed", str(e))
+
+
+    def _setup_audio_engine(self):
+        self.player = QtMultimedia.QMediaPlayer(self)
+        self.audio_output = QtMultimedia.QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+
+        mp3_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.mp3")
+        if os.path.exists(mp3_path):
+            self.player.setSource(QtCore.QUrl.fromLocalFile(mp3_path))
+
+        saved_vol = self.settings.value("sound_volume", 50, type=int)
+        self.audio_output.setVolume(saved_vol / 100.0)
+
+        # 25-second cutoff timer
+        self.audio_stop_timer = QtCore.QTimer(self)
+        self.audio_stop_timer.setSingleShot(True)
+        self.audio_stop_timer.timeout.connect(self.stop_alert_audio)
+
+    def play_alert_audio(self, max_duration_sec=25):
+        if not self.settings.value("sound_alerts_enabled", True, type=bool):
+            return
+        if self.player.playbackState() == QtMultimedia.QMediaPlayer.PlayingState:
+            self.player.stop()
+
+        self.player.setPosition(0)
+        self.player.play()
+        self.audio_stop_timer.start(max_duration_sec * 1000)
+
+    def stop_alert_audio(self):
+        if hasattr(self, "player") and self.player.playbackState() == QtMultimedia.QMediaPlayer.PlayingState:
+            self.player.stop()
+
+    def _handle_clear_alerts(self):
+        self.alerted.clear()
+        self.stop_alert_audio()
+
+    def launch_network_diagnostics(self):
+        import subprocess, shutil
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        diag_script = os.path.join(root_dir, "diagnose_network.sh")
+        
+        # Check available terminal emulators
+        terms = ["gnome-terminal", "x-terminal-emulator", "konsole", "xfce4-terminal", "xterm"]
+        found_term = next((t for t in terms if shutil.which(t)), None)
+        
+        if found_term:
+            if found_term == "gnome-terminal" or found_term == "x-terminal-emulator":
+                subprocess.Popen([found_term, "--", "bash", diag_script])
+            else:
+                subprocess.Popen([found_term, "-e", f"bash {diag_script}"])
+        else:
+            subprocess.Popen(["bash", diag_script])
+
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
+    def handle_logout(self):
+        # 1. Stop all active timers
+        for timer_name in ("timer", "daily_report_timer", "hb_timer", "clock_timer"):
+            t = getattr(self, timer_name, None)
+            if t is not None:
+                t.stop()
+
+        # 2. Safely wait for running background threads
+        for worker_name in ("worker", "bg_doy_worker", "audit_worker", "_hdr_conn_worker"):
+            w = getattr(self, worker_name, None)
+            if w is not None and w.isRunning():
+                w.quit()
+                w.wait(1500)
+
+        # 3. Wipe saved credentials, auto-login flags, and disk cookie jar
+        s = QtCore.QSettings("gnss-tools", "cddis-monitor")
+        s.setValue("auto_login", False)
+        s.remove("password")
+        s.setValue("remember", False)
+        s.sync()
+        try:
+            cookie_path = os.path.expanduser("~/.cddis_cookies.txt")
+            if os.path.exists(cookie_path):
+                os.remove(cookie_path)
+        except Exception:
+            pass
+
+        # 4. Remove Earthdata entries from ~/.netrc if present
+        try:
+            import os
+            netrc_path = os.path.expanduser("~/.netrc")
+            if os.path.exists(netrc_path):
+                with open(netrc_path, "r") as nf:
+                    lines = nf.readlines()
+                filtered = []
+                skip = False
+                for line in lines:
+                    if "machine urs.earthdata.nasa.gov" in line:
+                        skip = True
+                        continue
+                    if skip and line.strip().startswith("machine"):
+                        skip = False
+                    if not skip:
+                        filtered.append(line)
+                with open(netrc_path, "w") as nf:
+                    nf.writelines(filtered)
+        except Exception:
+            pass
+
+        # 4b. Hide and tear down system tray icon
+        if hasattr(self, "tray") and self.tray:
+            self.tray.hide()
+            self.tray.deleteLater()
+            self.tray = None
+
+        # 5. Clear active session cookies
+        if hasattr(self, "session") and self.session and hasattr(self.session, "cookies"):
+            self.session.cookies.clear()
+
+        # 6. Signal application controller to return to LoginDialog
+        self.logout_requested = True
+        self.close()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1731,7 +3684,24 @@ International GNSS Service (IGS).
         self.setCentralWidget(central)
         # Menu Bar Construction
         menubar = self.menuBar()
+        custom_act = menubar.addAction("Custom Scan")
+        custom_act.triggered.connect(self.open_custom_scan_dialog)
         help_menu = menubar.addMenu("&Help && Info")
+
+        # Right-aligned live CDDIS connection status pill in top header bar
+        self.conn_pill_btn = QtWidgets.QPushButton("● Checking CDDIS…")
+        self.conn_pill_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.conn_pill_btn.setToolTip("Click to open Connection Troubleshooter & Session Repair")
+        self.conn_pill_btn.clicked.connect(self.open_connection_troubleshooter)
+        menubar.setCornerWidget(self.conn_pill_btn, QtCore.Qt.TopRightCorner)
+        self._set_conn_pill_state("connected", "CDDIS Connected")
+
+        # Background heartbeat every 10 minutes + initial check
+        self._conn_heartbeat_timer = QtCore.QTimer(self)
+        self._conn_heartbeat_timer.setInterval(10 * 60 * 1000)
+        self._conn_heartbeat_timer.timeout.connect(self._probe_header_connection)
+        self._conn_heartbeat_timer.start()
+        QtCore.QTimer.singleShot(1200, self._probe_header_connection)
 
         act_how_to = help_menu.addAction("📖 How to Use / Guide")
         act_how_to.triggered.connect(self._show_how_to_use_dialog)
@@ -2575,6 +4545,76 @@ International GNSS Service (IGS).
             self._start_background_doy_catchup()
 
     
+    def _set_conn_pill_state(self, state, label_text):
+        if not hasattr(self, "conn_pill_btn"):
+            return
+        if state == "connected":
+            self.conn_pill_btn.setText(f"● {label_text}")
+            self.conn_pill_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #f0fdf4; color: #15803d;
+                    border: 1px solid #bbf7d0; border-radius: 6px;
+                    padding: 4px 12px; margin: 3px 6px;
+                    font-size: 11px; font-weight: 600;
+                }
+                QPushButton:hover { background-color: #dcfce7; }
+            """)
+        elif state == "expired":
+            self.conn_pill_btn.setText(f"▲ {label_text}")
+            self.conn_pill_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #fffbeb; color: #b45309;
+                    border: 1px solid #fde68a; border-radius: 6px;
+                    padding: 4px 12px; margin: 3px 6px;
+                    font-size: 11px; font-weight: 600;
+                }
+                QPushButton:hover { background-color: #fef3c7; }
+            """)
+        elif state == "offline":
+            self.conn_pill_btn.setText(f"✕ {label_text}")
+            self.conn_pill_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #fff1f0; color: #d92d20;
+                    border: 1px solid #fecdca; border-radius: 6px;
+                    padding: 4px 12px; margin: 3px 6px;
+                    font-size: 11px; font-weight: 600;
+                }
+                QPushButton:hover { background-color: #fee4e2; }
+            """)
+        else:
+            self.conn_pill_btn.setText(f"● {label_text}")
+            self.conn_pill_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #ffffff; color: #6e6e73;
+                    border: 1px solid #d2d2d7; border-radius: 6px;
+                    padding: 4px 12px; margin: 3px 6px;
+                    font-size: 11px; font-weight: 600;
+                }
+                QPushButton:hover { background-color: #f5f5f7; }
+            """)
+
+    def _probe_header_connection(self):
+        if getattr(self, "_hdr_conn_worker", None) and self._hdr_conn_worker.isRunning():
+            return
+        self._hdr_conn_worker = ConnectionCheckWorker(self.session, repair=False, parent=self)
+        self._hdr_conn_worker.finished_check.connect(lambda st, txt, _rep: self._set_conn_pill_state(st, txt))
+        self._hdr_conn_worker.start()
+
+    def open_connection_troubleshooter(self):
+        dlg = ConnectionTroubleshooterDialog(self, self.session)
+        dlg.status_updated.connect(self._set_conn_pill_state)
+        dlg.exec()
+
+    def open_custom_scan_dialog(self):
+        dlg = CustomScanDialog(
+            self,
+            self.session,
+            default_stations=self.stations.text().strip(),
+            default_dtype=self.type_box.currentText(),
+            default_out_dir=self.report_path.text().strip()
+        )
+        dlg.exec()
+
     def open_gap_analyzer(self):
         target_dir = self.report_path.text().strip() or os.path.expanduser("~/cddis_reports")
         stations = self.parse_stations()
@@ -3063,7 +5103,7 @@ International GNSS Service (IGS).
             self.tray.deleteLater()
             self.tray = None
         # Terminate any running background workers
-        for worker_name in ("worker", "bg_doy_worker", "audit_worker"):
+        for worker_name in ("worker", "bg_doy_worker", "audit_worker", "_hdr_conn_worker"):
             w = getattr(self, worker_name, None)
             if w is not None and w.isRunning():
                 w.quit()
@@ -3071,6 +5111,7 @@ International GNSS Service (IGS).
         self._save_settings()
         self.log("Application closed.")
         super().closeEvent(event)
+        QtWidgets.QApplication.exit(0)
     def _hourly(self):
         return DATA_TYPES[self.type_box.currentText()]["hourly"]
 
@@ -3582,7 +5623,51 @@ International GNSS Service (IGS).
                             it_s.setFont(f_s)
                         stn_tbl.setItem(stn_row_idx, j, it_s)
 
+    def _save_slot_to_live_state(self, r):
+        try:
+            import json
+            root = self.report_path.text().strip() or os.path.expanduser("~/Downloads/CDDM")
+            stn = r["station"].upper()
+            year = int(r["year"])
+            doy = int(r["doy"])
+            hh_str = str(r.get("hour_str", "00"))
+            stn_dir = os.path.join(root, stn)
+            os.makedirs(stn_dir, exist_ok=True)
+            live_path = os.path.join(stn_dir, f"{year}_DOY{doy:03d}_live.json")
+
+            data = {"year": year, "doy": doy, "station": stn, "slots": {}}
+            if os.path.exists(live_path):
+                try:
+                    with open(live_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    pass
+
+            checked_str = r["checked"].strftime("%H:%M:%S UTC") if hasattr(r.get("checked"), "strftime") else str(r.get("checked", "-"))
+            existing_slot = data.setdefault("slots", {}).get(hh_str, {})
+            if existing_slot.get("status") == "OK" and existing_slot.get("checked_utc"):
+                locked_ts = existing_slot["checked_utc"]
+            else:
+                locked_ts = checked_str
+
+            data["slots"][hh_str] = {
+                "status": r.get("status", "PENDING"),
+                "files": r.get("filenames", "-"),
+                "checked_utc": locked_ts,
+            }
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
     def on_slot_checked(self, r):
+        _st = str(r.get("status", "")).upper()
+        if _st in ("OK", "PENDING", "MISSING"):
+            self._set_conn_pill_state("connected", "CDDIS Connected")
+        elif "AUTH" in _st or "EXPIRED" in _st:
+            self._set_conn_pill_state("expired", "Session Expired")
+        elif "ERR" in _st or "OFFLINE" in _st or "TIMEOUT" in _st:
+            self._set_conn_pill_state("offline", "Connection Error")
         hh = r["slot"].hour if hasattr(r["slot"], "hour") else 0
         self.hb_led.setStyleSheet("color: #ff9500; font-size: 13px; border: none; background: transparent;")
         self.hb_label.setText(f"Scanning Hr {hh:02d} ({r.get('station', '')})...")
@@ -4059,7 +6144,7 @@ International GNSS Service (IGS).
                 t.stop()
 
         # 2. Safely wait for running background threads
-        for worker_name in ("worker", "bg_doy_worker", "audit_worker"):
+        for worker_name in ("worker", "bg_doy_worker", "audit_worker", "_hdr_conn_worker"):
             w = getattr(self, worker_name, None)
             if w is not None and w.isRunning():
                 w.quit()
@@ -4108,12 +6193,44 @@ International GNSS Service (IGS).
         self.close()
 
 
+
+
 def main():
+    from PySide6 import QtNetwork
     is_autostart = "--autostart" in sys.argv
 
     sys.argv[0] = "cddm"
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # Single-instance guard: raise existing window instead of opening a duplicate process
+    server_name = "cddm_live_v1_single_instance"
+    probe_sock = QtNetwork.QLocalSocket()
+    probe_sock.connectToServer(server_name)
+    if probe_sock.waitForConnected(400):
+        probe_sock.write(b"RAISE")
+        probe_sock.flush()
+        probe_sock.waitForBytesWritten(400)
+        probe_sock.disconnectFromServer()
+        sys.exit(0)
+
+    QtNetwork.QLocalServer.removeServer(server_name)
+    instance_server = QtNetwork.QLocalServer(app)
+    instance_server.listen(server_name)
+    active_win_ref = {"win": None}
+
+    def _on_second_launch():
+        conn = instance_server.nextPendingConnection()
+        if conn:
+            conn.waitForReadyRead(200)
+            conn.close()
+        w = active_win_ref.get("win")
+        if w is not None:
+            w.showNormal()
+            w.raise_()
+            w.activateWindow()
+
+    instance_server.newConnection.connect(_on_second_launch)
     app.setDesktopFileName("cddm")
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cddis_icon.png")
     if os.path.exists(icon_path):
@@ -4128,10 +6245,11 @@ def main():
         saved_user = settings.value("username", "")
         saved_pass = settings.value("password", "")
 
-        # Try automatic silent authentication if credentials exist and auto_login is active
+        # Try automatic silent authentication ONLY if auto_login is active AND a saved password exists
         if auto_login and saved_user and saved_pass:
             try:
-                test_sess = EarthdataSession(saved_user, saved_pass)
+                decoded_pw = base64.b64decode(saved_pass.encode()).decode()
+                test_sess = EarthdataSession(saved_user, decoded_pw)
                 r = test_sess.get(f"{BASE}/daily/", timeout=25, allow_redirects=True)
                 if r.status_code == 200 and "urs.earthdata.nasa.gov" not in r.url:
                     session = test_sess
@@ -4148,8 +6266,10 @@ def main():
 
         win = MainWindow(session, is_autostart=is_autostart)
         win.logout_requested = False
+        active_win_ref["win"] = win
         win.show()
         app.exec()
+        active_win_ref["win"] = None
 
         # If user explicitly logged out, reopen the login dialog; otherwise exit
         if not getattr(win, "logout_requested", False):
