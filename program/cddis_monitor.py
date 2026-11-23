@@ -508,6 +508,36 @@ def list_dir(session, url):
 
 
 
+def verify_earthdata_session(sess, max_attempts=3, timeout=20):
+    """Lightweight probe against CDDIS that avoids large chunked directory transfers and retries transient proxy drops."""
+    import time
+    last_err = None
+    probe_url = f"{BASE}/hourly/"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with sess.get(probe_url, timeout=timeout, allow_redirects=True, stream=True) as r:
+                if "urs.earthdata.nasa.gov" in r.url and "/oauth/authorize" in r.url:
+                    return False, "auth", "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
+                if r.status_code in (401, 403):
+                    return False, "auth", "Incorrect username or password."
+                if r.status_code != 200:
+                    return False, "network", f"Server returned unexpected HTTP {r.status_code}."
+                # Read a small chunk to confirm stream validity without downloading huge HTML listings
+                try:
+                    next(r.iter_content(chunk_size=1024), b"")
+                except Exception:
+                    pass
+                return True, "ok", "Connected successfully."
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            if attempt < max_attempts:
+                time.sleep(0.8 * attempt)
+                continue
+        except Exception as e:
+            return False, "network", f"Err: {str(e)} | {type(e).__name__}"
+    return False, "network", f"Transient network/proxy interruption ({type(last_err).__name__}). Please try again."
+
+
 class LoginWorker(QtCore.QThread):
     finished_auth = QtCore.Signal(bool, str, str)
 
@@ -525,47 +555,13 @@ class LoginWorker(QtCore.QThread):
             pass
 
     def run(self):
-        try:
-            sess = EarthdataSession(self.username, self.password)
-            test_url = f"{BASE}/daily/"
-            # Use session-level proxies automatically configured by EarthdataSession
-            r = sess.get(test_url, timeout=30, allow_redirects=True)
-
-            if "urs.earthdata.nasa.gov" in r.url and "/oauth/authorize" in r.url:
-                self.finished_auth.emit(
-                    False, "auth",
-                    "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
-                )
-                return
-
-            if r.status_code in (401, 403):
-                self.finished_auth.emit(
-                    False, "auth",
-                    "Incorrect username or password."
-                )
-                return
-
-            if r.status_code != 200:
-                self.finished_auth.emit(
-                    False, "network",
-                    f"Server returned unexpected HTTP {r.status_code}."
-                )
-                return
-
+        sess = EarthdataSession(self.username, self.password)
+        ok, err_type, msg = verify_earthdata_session(sess, max_attempts=3, timeout=25)
+        if ok:
             self.result_session = sess
-            self.finished_auth.emit(True, "ok", "Connected successfully.")
-        except requests.exceptions.Timeout:
-            self.finished_auth.emit(
-                False, "network",
-                "Connection timed out. CDDIS server took too long to respond."
-            )
-        except requests.exceptions.ConnectionError:
-            self.finished_auth.emit(
-                False, "network",
-                "Network connection error. Waiting for internet..."
-            )
-        except Exception as e:
-            self.finished_auth.emit(False, "network", f"Err: {str(e)} | {type(e).__name__}")
+            self.finished_auth.emit(True, "ok", msg)
+        else:
+            self.finished_auth.emit(False, err_type, msg)
 
 class LoginDialog(QtWidgets.QDialog):
     MAX_BOOT_RETRIES = 12
@@ -5556,8 +5552,8 @@ def main():
             try:
                 decoded_pw = base64.b64decode(saved_pass.encode()).decode()
                 test_sess = EarthdataSession(saved_user, decoded_pw)
-                r = test_sess.get(f"{BASE}/daily/", timeout=25, allow_redirects=True)
-                if r.status_code == 200 and "urs.earthdata.nasa.gov" not in r.url:
+                ok, _, _ = verify_earthdata_session(test_sess, max_attempts=3, timeout=20)
+                if ok:
                     session = test_sess
             except Exception:
                 session = None
