@@ -509,25 +509,43 @@ def list_dir(session, url):
 
 
 def verify_earthdata_session(sess, max_attempts=3, timeout=20):
-    """Lightweight probe against CDDIS that avoids large chunked directory transfers and retries transient proxy drops."""
+    """Lightweight probe against CDDIS with explicit URS OAuth handshake fallback and transient proxy retry."""
     import time
+    from requests.auth import HTTPBasicAuth
     last_err = None
     probe_url = f"{BASE}/hourly/"
     for attempt in range(1, max_attempts + 1):
         try:
+            # Clear expired cookies on retry so stale CDDIS tokens don't loop on /oauth/authorize
+            if attempt > 1 and hasattr(sess, "cookies"):
+                sess.cookies.clear()
+
             with sess.get(probe_url, timeout=timeout, allow_redirects=True, stream=True) as r:
-                if "urs.earthdata.nasa.gov" in r.url and "/oauth/authorize" in r.url:
-                    return False, "auth", "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
-                if r.status_code in (401, 403):
-                    return False, "auth", "Incorrect username or password."
-                if r.status_code != 200:
-                    return False, "network", f"Server returned unexpected HTTP {r.status_code}."
-                # Read a small chunk to confirm stream validity without downloading huge HTML listings
-                try:
-                    next(r.iter_content(chunk_size=1024), b"")
-                except Exception:
-                    pass
-                return True, "ok", "Connected successfully."
+                final_url = r.url
+                status_code = r.status_code
+
+            # If redirected to NASA URS OAuth endpoint, explicitly send BasicAuth to complete the handshake
+            if "urs.earthdata.nasa.gov" in final_url and getattr(sess, "auth_creds", None):
+                with sess.get(
+                    final_url,
+                    auth=HTTPBasicAuth(*sess.auth_creds),
+                    timeout=timeout,
+                    allow_redirects=True,
+                    stream=True,
+                ) as r2:
+                    final_url = r2.url
+                    status_code = r2.status_code
+
+            if "urs.earthdata.nasa.gov" in final_url and "/oauth/authorize" in final_url:
+                if attempt < max_attempts:
+                    time.sleep(1.0 * attempt)
+                    continue
+                return False, "auth", "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
+            if status_code in (401, 403):
+                return False, "auth", "Incorrect username or password."
+            if status_code != 200:
+                return False, "network", f"Server returned unexpected HTTP {status_code}."
+            return True, "ok", "Connected successfully."
         except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_err = e
             if attempt < max_attempts:
