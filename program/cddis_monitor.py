@@ -525,6 +525,7 @@ def verify_earthdata_session(sess, max_attempts=3, timeout=20):
                 status_code = r.status_code
 
             # If redirected to NASA URS OAuth endpoint, explicitly send BasicAuth to complete the handshake
+            body_hint = ""
             if "urs.earthdata.nasa.gov" in final_url and getattr(sess, "auth_creds", None):
                 with sess.get(
                     final_url,
@@ -535,14 +536,19 @@ def verify_earthdata_session(sess, max_attempts=3, timeout=20):
                 ) as r2:
                     final_url = r2.url
                     status_code = r2.status_code
+                    if status_code in (401, 403):
+                        try:
+                            body_hint = r2.text.strip()[:220]
+                        except Exception:
+                            body_hint = ""
 
-            if "urs.earthdata.nasa.gov" in final_url and "/oauth/authorize" in final_url:
-                if attempt < max_attempts:
-                    time.sleep(1.0 * attempt)
-                    continue
-                return False, "auth", "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
+            # Never retry on 401/403 so we do not trigger NASA Earthdata's 10-minute lockout
             if status_code in (401, 403):
-                return False, "auth", "Incorrect username or password."
+                if "locked" in body_hint.lower() or "exceeded" in body_hint.lower():
+                    return False, "auth", f"NASA Earthdata URS: {body_hint}"
+                return False, "auth", "Incorrect username or password (HTTP 401/403)."
+            if "urs.earthdata.nasa.gov" in final_url and "/oauth/authorize" in final_url:
+                return False, "auth", "Authentication error: Authorize 'CDDIS' in your Earthdata profile."
             if status_code != 200:
                 return False, "network", f"Server returned unexpected HTTP {status_code}."
             return True, "ok", "Connected successfully."
